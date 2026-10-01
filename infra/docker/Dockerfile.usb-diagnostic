@@ -1,0 +1,8 @@
+ARG BASE_IMAGE=debian:bookworm-slim
+FROM ${BASE_IMAGE}
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-usb libusb-1.0-0 adb alsa-utils usbutils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY usb_at.py /opt/cbd/usb_at.py
+ENTRYPOINT ["python3", "/opt/cbd/usb_at.py"]

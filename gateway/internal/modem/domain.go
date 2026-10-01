@@ -114,6 +114,8 @@ type RawSMS struct {
 type ModemEvent struct {
 	Kind   string
 	CallID CallID
-	Peer   string
-	Raw    string
+	// PhysicalCallID survives logical HTTP id translation for SIP ownership.
+	PhysicalCallID CallID
+	Peer           string
+	Raw            string
 }

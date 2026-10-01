@@ -24,6 +24,7 @@ const (
 	Connecting      State = "connecting"
 	Active          State = "active"
 	Ending          State = "ending"
+	Ended           State = "ended"
 	Recovering      State = "recovering"
 )
 
@@ -149,6 +150,41 @@ func (c *Controller) Answer(requestID, callID string) (Call, Event, error) {
 	})
 }
 
+// Connected observes a SIP bridge that has confirmed the cellular answer and
+// started audio. It must not issue a second ATA or depend on HTTP/WebRTC actions.
+func (c *Controller) Connected(callID string) (Call, Event, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.active == nil || c.active.ID != callID {
+		return Call{}, Event{}, ErrCallNotFound
+	}
+	if c.active.State == Ending {
+		return Call{}, Event{}, ErrInvalidState
+	}
+	if c.active.ConnectedAt != nil {
+		return *c.active, Event{}, ErrDuplicateEvent
+	}
+	now := c.now()
+	c.active.ConnectedAt = &now
+	c.active.State = Active
+	c.active.CellularReady, c.active.MediaReady, c.active.Answered = true, true, true
+	return *c.active, Event{CallID: callID, State: Active, Kind: "call.updated"}, nil
+}
+
+func (c *Controller) UpdatePeer(callID, peer string) (Call, Event, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.active == nil || c.active.ID != callID {
+		return Call{}, Event{}, ErrCallNotFound
+	}
+	peer = strings.TrimSpace(peer)
+	if peer == "" || peer == "unknown" || peer == c.active.Peer {
+		return *c.active, Event{}, ErrDuplicateEvent
+	}
+	c.active.Peer = peer
+	return *c.active, Event{CallID: callID, State: c.active.State, Kind: "call.updated"}, nil
+}
+
 func (c *Controller) MarkCellularReady(callID string) (Call, Event, error) {
 	return c.mutate("cellular-ready:"+callID, callID, "cellular_ready", func(call *Call) error {
 		if call.State != OutgoingDialing && call.State != Connecting {
@@ -266,8 +302,9 @@ func (c *Controller) Finish(callID string) (Call, Event, error) {
 	}
 	ended := c.now()
 	c.active.EndedAt = &ended
+	c.active.State = Ended
 	call := *c.active
-	event := Event{CallID: callID, State: Ending, Kind: "call.ended", Reason: call.EndReason}
+	event := Event{CallID: callID, State: Ended, Kind: "call.ended", Reason: call.EndReason}
 	c.active = nil
 	return call, event, nil
 }

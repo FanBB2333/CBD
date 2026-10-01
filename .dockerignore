@@ -1,0 +1,15 @@
+# Send only the gateway source and the image's non-secret example config.
+**
+!gateway/
+!gateway/**
+!infra/
+!infra/config.example.yaml
+gateway/bin/
+gateway/*.test
+gateway/*.out
+**/.env
+**/config.yaml
+**/config.local.yaml
+**/*.sqlite*
+**/*.key
+**/*.pem

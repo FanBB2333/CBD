@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +54,7 @@ var trustedRuntimeArtifacts = []runtimeArtifact{
 // physical USB module that owns the configured modem port.
 type Config struct {
 	TTY        string
+	USBPath    string // Physical USB port; required when TTY is a userspace PTY.
 	RuntimeDir string
 	ADBPath    string
 	Bootstrap  bool
@@ -73,75 +75,45 @@ type commandRunner struct{ path string }
 // QDC507 transport list deterministic regardless of host daemon state.
 const adbServerSocket = "tcp:localhost:5038"
 
+// Run uses a private loopback ADB server without killing host ADB processes.
+// Inherit PATH and the container user's writable home; /root is unavailable
+// to the non-root cellbridge image user.
 func (r commandRunner) Run(ctx context.Context, args ...string) (string, error) {
-	if isADBServerInvocation(args) {
-		// USB transport discovery is single-listener: the OS-level adb
-		// daemon (tcp:5037, auto-started by fnOS on every boot) claims
-		// the module's USB transport and a second daemon can never
-		// enumerate it. Kill ONLY the host 5037 daemon — never our own
-		// 5038 private daemon (a broad pattern like "adb.*fork-server"
-		// matches both and causes a cold-start loop: each call kills our
-		// daemon, start-server re-enumerates USB, >10s, deadline
-		// exceeded. Observed 2026-09-06 reboot).
-		cleanup := exec.CommandContext(ctx, "pkill", "-f", "[a]db.*tcp:localhost:5037")
-		_ = cleanup.Run()
-		cleanup2 := exec.CommandContext(ctx, "pkill", "-f", "[a]db.*nodaemon.*5037")
-		_ = cleanup2.Run()
-		startCtx, startCancel := context.WithTimeout(ctx, 10*time.Second)
-		startup := exec.CommandContext(startCtx, r.path, "start-server")
-		startup.Env = append(startup.Env, "ADB_SERVER_SOCKET="+adbServerSocket)
-		startup.Env = append(startup.Env, "HOME=/root")
-		if _, err := startup.CombinedOutput(); err != nil {
-			slog.Warn("adb start-server (private socket)", "error", err)
+	cmd := exec.CommandContext(ctx, r.path, append([]string{"-L", adbServerSocket}, args...)...)
+	for _, value := range os.Environ() {
+		if !strings.HasPrefix(value, "ADB_SERVER_SOCKET=") {
+			cmd.Env = append(cmd.Env, value)
 		}
-		startCancel()
 	}
-	cmd := exec.CommandContext(ctx, r.path, args...)
-	if isADBServerInvocation(args) {
-		cmd.Env = append(cmd.Env, "ADB_SERVER_SOCKET="+adbServerSocket)
-		cmd.Env = append(cmd.Env, "HOME=/root")
-		// Pin the client to our private server via -L (no env-var
-		// dependency, no ADB_TRACE flag which this adb build rejects).
-		cmd.Args = append([]string{r.path, "-L", adbServerSocket}, args...)
-	}
+	cmd.Env = append(cmd.Env, "ADB_SERVER_SOCKET="+adbServerSocket)
 	output, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(output)), err
-}
-
-// isADBServerInvocation reports whether args begin an adb client call that
-// needs the private server socket (any argument form; the path is adb).
-func isADBServerInvocation(args []string) bool {
-	if len(args) == 0 {
-		return false
-	}
-	switch args[0] {
-	case "devices", "shell", "push", "pull", "-t", "kill-server", "start-server", "wait-for-device":
-		return true
-	}
-	return false
 }
 
 // Audio wraps host ALSA with the QDC507 module-side bootstrap. Bootstrap is
 // attempted only when this backend is explicitly enabled in configuration.
 type Audio struct {
-	host modem.VoiceAudio
-	cfg  Config
-	run  Runner
+	host    modem.VoiceAudio
+	cfg     Config
+	run     Runner
+	usbPath func(string) (string, error)
 
-	mu       sync.Mutex
-	call     modem.CallID
-	prepared      bool
-	lastRotate    time.Time
+	opMu          sync.Mutex // serializes route preparation and host audio lifecycle
+	mu            sync.Mutex
+	call          modem.CallID
 	routePrepared bool
-	once     sync.Once
+	once          sync.Once
 }
 
 func Open(host modem.VoiceAudio, cfg Config) (*Audio, error) {
 	if host == nil {
 		return nil, errors.New("QDC507 voice backend requires a host audio adapter")
 	}
-	if strings.TrimSpace(cfg.TTY) == "" {
+	if strings.TrimSpace(cfg.TTY) == "" && cfg.USBPath == "" {
 		return nil, errors.New("QDC507 voice backend requires the configured modem TTY")
+	}
+	if cfg.USBPath != "" && !regexp.MustCompile(`^[1-9][0-9]*-[1-9][0-9]*(\.[1-9][0-9]*)*$`).MatchString(cfg.USBPath) {
+		return nil, errors.New("QDC507 USB path must identify a physical USB port")
 	}
 	if strings.TrimSpace(cfg.RuntimeDir) == "" {
 		return nil, errors.New("QDC507 voice backend requires an external runtime directory")
@@ -150,7 +122,7 @@ func Open(host modem.VoiceAudio, cfg Config) (*Audio, error) {
 	if path == "" {
 		path = "adb"
 	}
-	return &Audio{host: host, cfg: cfg, run: commandRunner{path: path}}, nil
+	return &Audio{host: host, cfg: cfg, run: commandRunner{path: path}, usbPath: usbPathForTTY}, nil
 }
 
 func OpenWithRunner(host modem.VoiceAudio, cfg Config, runner Runner) (*Audio, error) {
@@ -205,16 +177,27 @@ func (a *Audio) routeAlive(ctx context.Context) (bool, error) {
 
 // PrepareRoute brings the remote VoLTE route up (calibration + mavo
 // session) without opening the host capture/playback pair. The route is
-// left RUNNING persistently once calibrated — the 2026-09-01 milestone
-// that produced real audio kept mavo alive and audio_enable=1 across
-// calls; killing and re-spawning it per call wedged the UAC stream into
-// silence. A dead route (module reboot, crashed mavo) is rebuilt and
-// re-verified here.
+// reused by Start for this call. Stop invalidates it, so a subsequent
+// call gets a fresh route even when the preceding call lasted <30 seconds.
 func (a *Audio) PrepareRoute(ctx context.Context) error {
+	a.opMu.Lock()
+	defer a.opMu.Unlock()
+	a.mu.Lock()
+	if a.call != "" {
+		a.mu.Unlock()
+		return errors.New("cannot prepare QDC507 route during active audio")
+	}
+	// A fresh preparation belongs to a new call, even when the last one
+	// was cancelled before host PCM started. Process liveness alone does
+	// not prove that its old cellular route will carry the next call.
+	a.routePrepared = false
+	a.mu.Unlock()
 	return a.ensureRuntime(ctx)
 }
 
 func (a *Audio) Start(ctx context.Context, callID modem.CallID) error {
+	a.opMu.Lock()
+	defer a.opMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -231,7 +214,15 @@ func (a *Audio) Start(ctx context.Context, callID modem.CallID) error {
 	a.mu.Lock()
 	a.call = callID
 	a.mu.Unlock()
-	return a.host.Start(ctx, callID)
+	if err := a.host.Start(ctx, callID); err != nil {
+		a.mu.Lock()
+		a.call = ""
+		a.routePrepared = false
+		a.mu.Unlock()
+		_ = a.host.Stop(ctx)
+		return err
+	}
+	return nil
 }
 
 func (a *Audio) ReadPCM(samples []int16) (int, error) { return a.host.ReadPCM(samples) }
@@ -239,18 +230,27 @@ func (a *Audio) ReadPCM(samples []int16) (int, error) { return a.host.ReadPCM(sa
 func (a *Audio) WritePCM(samples []int16) (int, error) { return a.host.WritePCM(samples) }
 
 func (a *Audio) Stop(ctx context.Context) error {
+	a.opMu.Lock()
+	defer a.opMu.Unlock()
 	a.mu.Lock()
 	active := a.call != ""
+	prepared := a.routePrepared
 	a.call = ""
+	a.routePrepared = false
 	a.mu.Unlock()
-	// Only the host UAC pair is torn down. The module-side VoLTE route
-	// (mavo + audio_enable=1) stays RUNNING across calls — the
-	// 2026-09-01 milestone with real audio kept it persistent; killing
-	// it per call wedged the UAC stream into silence.
-	if !active {
-		return nil
+	// A route is reusable only within this call, never by elapsed time.
+	// Even a very short call consumes it (dontmove-kit route-rearm finding).
+	// Rebuild on the next PrepareRoute/Start, after capture has closed.
+	var err error
+	if active {
+		err = a.host.Stop(ctx)
 	}
-	return a.host.Stop(ctx)
+	if active || prepared {
+		stopCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		defer cancel()
+		err = errors.Join(err, a.stopRemoteRoute(stopCtx))
+	}
+	return err
 }
 
 func (a *Audio) Close() error {
@@ -269,34 +269,16 @@ func (a *Audio) ensureRuntime(ctx context.Context) error {
 		return errors.New("QDC507 voice bootstrap is disabled")
 	}
 	a.mu.Lock()
-	prepared := a.prepared
+	routePrepared := a.routePrepared
 	a.mu.Unlock()
-	if prepared {
-		// Per-call route rotation (2026-09-06 findings): the QDC507 UAC
-		// gadget's ASYNC capture stream dies after aplay/arecord have
-		// touched it once. A fresh mavo voice-route session restores it.
-		// The 09:01 milestone that first produced real audio (peak 4586)
-		// had just re-created the route; every silent call followed a
-		// reused session. So each call explicitly re-rotates the route —
-		// never trust a cached "alive" session.
-		//
-		// But rotate only ONCE per call: PrepareRoute (pre-dial) already
-		// recreated the route seconds ago, and bridge.Start calls
-		// ensureRuntime again right after answer — a second rotation
-		// there doubles connect latency (observed 2026-09-06: dial→alert
-		// ~9s + answer→pair another ~4s). A route rotated within the
-		// last 30s is fresh enough to trust.
-		a.mu.Lock()
-		recent := time.Since(a.lastRotate) < 30*time.Second
-		a.mu.Unlock()
-		if recent {
+	if routePrepared {
+		if alive, err := a.routeAlive(ctx); err == nil && alive {
 			return nil
 		}
-		slog.Info("QDC507 rotating voice route for call")
+		// A module reboot invalidates both the route and its RAM-loaded drivers.
 		a.mu.Lock()
-		a.prepared = false
+		a.routePrepared = false
 		a.mu.Unlock()
-		return a.startRemoteRoute(ctx)
 	}
 	if err := verifyRuntimeDirectory(a.cfg.RuntimeDir); err != nil {
 		return err
@@ -357,9 +339,6 @@ func (a *Audio) ensureRuntime(ctx context.Context) error {
 	if err != nil || strings.TrimSpace(endpoints) != "ready" {
 		return fmt.Errorf("QDC507 voice endpoints unavailable: %w (%s)", err, endpoints)
 	}
-	a.mu.Lock()
-	a.prepared = true
-	a.mu.Unlock()
 	return a.startRemoteRoute(ctx)
 }
 
@@ -431,8 +410,9 @@ func (a *Audio) startRemoteRoute(ctx context.Context) error {
 		ready, _ := a.adb(ctx, transport, "shell", routeReadyScript())
 		if strings.TrimSpace(ready) == "ready" {
 			a.mu.Lock()
-			a.lastRotate = time.Now()
+			a.routePrepared = true
 			a.mu.Unlock()
+			slog.Info("QDC507 fresh voice route ready")
 			return nil
 		}
 		time.Sleep(150 * time.Millisecond)
@@ -477,8 +457,8 @@ func (a *Audio) verifyTarget(ctx context.Context, transport string) error {
 	return nil
 }
 
-func (a *Audio) transportID(ctx context.Context) (string, error) {
-	resolved, err := filepath.EvalSymlinks(a.cfg.TTY)
+func usbPathForTTY(tty string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(tty)
 	if err != nil {
 		return "", fmt.Errorf("resolve QDC507 TTY: %w", err)
 	}
@@ -496,6 +476,24 @@ func (a *Audio) transportID(ctx context.Context) (string, error) {
 	}
 	if usbPath == "" {
 		return "", fmt.Errorf("QDC507 USB parent not found in %s", sysfsPath)
+	}
+	return usbPath, nil
+}
+
+func (a *Audio) transportID(ctx context.Context) (string, error) {
+	usbPath := a.cfg.USBPath
+	var err error
+	if usbPath == "" {
+		usbPath, err = a.usbPath(a.cfg.TTY)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		// PTYs have no /sys/class/tty USB ancestry. Verify the explicit port's
+		// USB identity before selecting ADB on that same physical device.
+		if err := verifyUSBIdentity("/sys/bus/usb/devices", usbPath); err != nil {
+			return "", err
+		}
 	}
 	// The private adb daemon (ADB_SERVER_SOCKET) starts async to the
 	// module's first enumeration; retry briefly so a fresh-boot probe
@@ -520,6 +518,22 @@ func (a *Audio) transportID(ctx context.Context) (string, error) {
 		}
 	}
 	return "", err
+}
+
+func verifyUSBIdentity(root, usbPath string) error {
+	vid, err := os.ReadFile(filepath.Join(root, usbPath, "idVendor"))
+	if err != nil {
+		return fmt.Errorf("read QDC507 USB vendor: %w", err)
+	}
+	pid, err := os.ReadFile(filepath.Join(root, usbPath, "idProduct"))
+	if err != nil {
+		return fmt.Errorf("read QDC507 USB product: %w", err)
+	}
+	identity := strings.ToLower(strings.TrimSpace(string(vid)) + ":" + strings.TrimSpace(string(pid)))
+	if identity != "2ca3:4006" && identity != "2c7c:0125" {
+		return fmt.Errorf("unsupported USB identity %s at pinned QDC507 port", identity)
+	}
+	return nil
 }
 
 func (a *Audio) adb(ctx context.Context, transport string, args ...string) (string, error) {

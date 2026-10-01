@@ -1,0 +1,63 @@
+# Standalone QNAP application. Do not combine with the legacy coturn compose.
+services:
+  gateway:
+    image: cellbridge-gateway:${VERSION:-qnap}
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: gateway/Dockerfile
+      args:
+        TARGETARCH: amd64
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+        GO_IMAGE: ${GO_IMAGE:-golang:1.25-bookworm}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-debian:bookworm-slim}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-http://deb.debian.org}
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    # QTS device nodes commonly belong to admin/root, not Debian's dialout GID.
+    # Root is confined to the container, with no Linux capabilities or host PID access.
+    user: "0:0"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    command: ["--config", "/etc/cellbridge/config.yaml"]
+    volumes:
+      - type: bind
+        source: ${CELLBRIDGE_CONFIG:?set absolute CELLBRIDGE_CONFIG}
+        target: /etc/cellbridge/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CELLBRIDGE_DATA_DIR:?set absolute CELLBRIDGE_DATA_DIR}
+        target: /var/lib/cellbridge
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CELLBRIDGE_RUNTIME_DIR:?set absolute CELLBRIDGE_RUNTIME_DIR}
+        target: /opt/cellbridge/module-voice
+        read_only: true
+        bind:
+          create_host_path: false
+      - /dev/bus/usb:/dev/bus/usb
+    devices:
+      # AT uses an in-container PTY; no host ttyUSB device is required.
+      - /dev/snd:/dev/snd:rwm
+    device_cgroup_rules:
+      # USB bus nodes change when the module re-enumerates after enabling UAC.
+      - "c 189:* rw"
+    environment:
+      HOME: /var/lib/cellbridge
+      CELLBRIDGE_SMS_DRY_RUN: ${CELLBRIDGE_SMS_DRY_RUN:-true}
+    healthcheck:
+      # HTTP health alone does not certify modem/voice readiness.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

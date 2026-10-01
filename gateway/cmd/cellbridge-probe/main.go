@@ -11,15 +11,28 @@ import (
 
 	"github.com/cellbridge/cellbridge/gateway/internal/modem/at"
 	"github.com/cellbridge/cellbridge/gateway/internal/modem/discovery"
+	"github.com/cellbridge/cellbridge/gateway/internal/modem/usbpty"
 )
 
 func main() {
 	devRoot := flag.String("device-root", "/dev", "device root to scan")
 	port := flag.String("port", "", "explicit serial path; use only when stable discovery is unavailable")
+	usbPath := flag.String("usb-path", "", "use userspace USB AT on this physical port, e.g. 1-2")
 	baud := flag.Int("baud", 9600, "serial baud rate (EC25/QDC507 commonly uses 9600)")
 	jsonOutput := flag.Bool("json", false, "write JSON report")
-	timeout := flag.Duration("timeout", 3*time.Second, "per AT command timeout")
+	timeout := flag.Duration("timeout", 3*time.Second, "total timeout per candidate modem")
 	flag.Parse()
+	if *usbPath != "" {
+		if *port != "" {
+			fatal(fmt.Errorf("--port and --usb-path are mutually exclusive"))
+		}
+		bridge, err := usbpty.Start(context.Background(), *usbPath)
+		if err != nil {
+			fatal(err)
+		}
+		defer bridge.Close()
+		*port = bridge.TTY
+	}
 
 	candidates, err := candidates(*devRoot, *port)
 	if err != nil {

@@ -1,4 +1,6 @@
-FROM golang:1.25-bookworm AS build
+ARG GO_IMAGE=golang:1.25-bookworm
+ARG RUNTIME_IMAGE=debian:bookworm-slim
+FROM ${GO_IMAGE} AS build
 
 WORKDIR /src
 COPY gateway/go.mod gateway/go.sum ./
@@ -13,14 +15,18 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' -o /out/cellbridge-probe ./cmd/cellbridge-probe
 
-FROM debian:bookworm-slim
+FROM ${RUNTIME_IMAGE}
 
-RUN apt-get update && apt-get install -y --no-install-recommends alsa-utils ffmpeg ca-certificates wget \
+ARG DEBIAN_MIRROR=http://deb.debian.org
+RUN sed -i "s|http://deb.debian.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::http::Pipeline-Depth=0 update \
+    && apt-get -o Acquire::http::Pipeline-Depth=0 install -y --no-install-recommends adb alsa-utils ffmpeg ca-certificates wget usbutils python3 python3-usb libusb-1.0-0 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system cellbridge && useradd --system --gid cellbridge --home-dir /var/lib/cellbridge cellbridge
 COPY --from=build /out/cellbridge-gateway /usr/local/bin/cellbridge-gateway
 COPY --from=build /out/cellbridge-admin /usr/local/bin/cellbridge-admin
 COPY --from=build /out/cellbridge-probe /usr/local/bin/cellbridge-probe
+COPY gateway/tools/usb_at.py /usr/local/lib/cellbridge/usb_at.py
 COPY infra/config.example.yaml /etc/cellbridge/config.example.yaml
 RUN mkdir -p /var/lib/cellbridge && chown -R cellbridge:cellbridge /var/lib/cellbridge
 

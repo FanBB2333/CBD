@@ -42,3 +42,31 @@ func TestProbeCapabilitiesDoesNotPromoteGenericEC25(t *testing.T) {
 		t.Fatalf("capabilities = %#v", value)
 	}
 }
+
+func TestIMSConfigurationIsNotRegistration(t *testing.T) {
+	for _, tc := range []struct {
+		response string
+		enabled  bool
+		invalid  bool
+	}{
+		{`+QCFG: "ims",0,1`, true, false},
+		{`+QCFG: "ims",1,1`, true, false},
+		{`+QCFG: "ims",2,1`, false, false},
+		{`+QCFG: "ims",0,0`, false, false},
+		{`+QCFG: "ims",1,0`, false, false},
+		{`+QCFG: "ims",3,1`, false, true},
+		{`+QCFG: "ims",0,2`, false, true},
+		{`+QCFG: "ims",x,1`, false, true},
+		{`+QCFG: "ims",1`, false, true},
+		{`+QCFG: "ims",0,1,1`, false, true},
+	} {
+		t.Run(tc.response, func(t *testing.T) {
+			enabled, valid, err := queryIMS(context.Background(), fakeExchanger{responses: map[string][]string{
+				`AT+QCFG="ims"`: {tc.response, "OK"},
+			}})
+			if enabled != tc.enabled || valid == tc.invalid || (err != nil) != tc.invalid {
+				t.Fatalf("enabled=%v valid=%v err=%v", enabled, valid, err)
+			}
+		})
+	}
+}

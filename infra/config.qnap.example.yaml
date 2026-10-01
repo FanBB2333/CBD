@@ -1,0 +1,53 @@
+# Copy to config.yaml; use the actual physical USB port and ALSA card.
+network:
+  mode: tailnet
+  transport: tailnet
+  tailnet_hostname: qnap-nas.example.ts.net
+  public_fallback: false
+server:
+  listen: 127.0.0.1:8787
+data:
+  dir: /var/lib/cellbridge
+modem:
+  adapter: qdc507
+  # Userspace bridge avoids requiring QTS option/usbserial drivers.
+  transport: usb-pty
+  usb_path: 1-2
+  tty: auto
+  baud: 9600
+  allow_usb_identity_changes: false
+voice:
+  # Enable BOTH only after the module identity, ABI, runtime and USB devices pass checks.
+  enabled: false
+  bootstrap: false
+  backend: qdc507
+  codec: pcmu
+  sample_rate: 8000
+  rx_path: hw:CARD=Baiwang,DEV=0
+  tx_path: hw:CARD=Baiwang,DEV=0
+  runtime_dir: /opt/cellbridge/module-voice
+sip:
+  # Enable after replacing the address and generating a unique SIP password.
+  enabled: false
+  listen: 100.64.0.10:5060
+  realm: cellbridge
+  users: []
+  push_token: ""
+sms:
+  # Initial diagnostics: upstream inbox polling imports then deletes modem SMS.
+  # Enable only after the persistent database and SMS reception are ready.
+  inbox_enabled: false
+webrtc:
+  private_turn:
+    enabled: false
+push:
+  mode: disabled
+recording:
+  enabled: true
+  auto_mode: off
+  retention_days: 30
+  minimum_free_bytes: 1073741824
+security:
+  pairing_local_only: true
+  admin_local_only: true
+  redact_logs: true

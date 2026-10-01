@@ -101,12 +101,28 @@ func (c *Client) SetDryRun(dryRun bool) {
 func (c *Client) Close() error { return c.port.Close() }
 
 func (c *Client) Exchange(ctx context.Context, command string) ([]string, error) {
+	return c.ExchangeSequence(ctx, command)
+}
+
+// ExchangeSequence keeps mode/storage selection and its dependent command
+// together, so inbox polling cannot change the mode of an SMS submission.
+// It returns the response of the final command only.
+func (c *Client) ExchangeSequence(ctx context.Context, commands ...string) ([]string, error) {
 	if err := c.acquireIO(ctx); err != nil {
 		return nil, err
 	}
 	defer c.releaseIO()
 	c.mu.Lock()
-	response, unsolicited, err := c.exchangeLocked(ctx, command)
+	var response, unsolicited []string
+	var err error
+	for _, command := range commands {
+		var pending []string
+		response, pending, err = c.exchangeLocked(ctx, command)
+		unsolicited = append(unsolicited, pending...)
+		if err != nil {
+			break
+		}
+	}
 	handler := c.lineHandle
 	c.mu.Unlock()
 	dispatchUnsolicited(handler, unsolicited)
@@ -169,6 +185,13 @@ func (c *Client) SendPDU(ctx context.Context, tpduLength int, pdu string) ([]str
 		c.mu.Unlock()
 		return nil, fmt.Errorf("invalid SMS PDU submission")
 	}
+	_, modeURC, modeErr := c.exchangeLocked(ctx, "AT+CMGF=0")
+	if modeErr != nil {
+		handler := c.lineHandle
+		c.mu.Unlock()
+		dispatchUnsolicited(handler, modeURC)
+		return nil, modeErr
+	}
 	cmd := "AT+CMGS"
 	if c.DryRun {
 		cmd = "AT+CMGW"
@@ -178,6 +201,7 @@ func (c *Client) SendPDU(ctx context.Context, tpduLength int, pdu string) ([]str
 		return nil, fmt.Errorf("write %s: %w", cmd, err)
 	}
 	_, unsolicited, err := c.readUntil(ctx, true)
+	unsolicited = append(modeURC, unsolicited...)
 	if err != nil {
 		handler := c.lineHandle
 		c.mu.Unlock()
@@ -338,7 +362,7 @@ func (c *Client) readUntil(ctx context.Context, prompt bool) ([]string, []string
 
 func isUnsolicited(line string) bool {
 	line = strings.TrimSpace(line)
-	return line == "RING" || strings.Contains(line, "NO CARRIER") || strings.Contains(line, "BUSY") || strings.Contains(line, "NO ANSWER")
+	return line == "RING" || strings.HasPrefix(line, "+CLIP:") || strings.HasPrefix(line, "+CMTI:") || strings.Contains(line, "NO CARRIER") || strings.Contains(line, "BUSY") || strings.Contains(line, "NO ANSWER")
 }
 
 func dispatchUnsolicited(handler func(string), lines []string) {
@@ -418,7 +442,7 @@ func OpenSerial(ctx context.Context, path string, baud int) (*Client, error) {
 	// Some USB serial interfaces block during open while the modem driver is
 	// being re-enumerated. O_NONBLOCK makes automatic discovery and all later
 	// reads bounded; readWithContext handles EAGAIN without busy spinning.
-	file, err := os.OpenFile(path, os.O_RDWR|syscall.O_NONBLOCK, 0)
+	file, err := os.OpenFile(path, os.O_RDWR|syscall.O_NONBLOCK|syscall.O_NOCTTY, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open serial port %s: %w", path, err)
 	}

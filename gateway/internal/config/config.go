@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -25,6 +26,8 @@ type Config struct {
 	} `yaml:"data"`
 	Modem struct {
 		Adapter                 string `yaml:"adapter"`
+		Transport               string `yaml:"transport"`
+		USBPath                 string `yaml:"usb_path"`
 		TTY                     string `yaml:"tty"`
 		Baud                    int    `yaml:"baud"`
 		AllowUSBIdentityChanges bool   `yaml:"allow_usb_identity_changes"`
@@ -76,6 +79,9 @@ type Config struct {
 			Password string `yaml:"password"`
 		} `yaml:"users"`
 	} `yaml:"sip"`
+	SMS struct {
+		InboxEnabled bool `yaml:"inbox_enabled"`
+	} `yaml:"sms"`
 }
 
 func Default() Config {
@@ -86,8 +92,10 @@ func Default() Config {
 	result.Server.Listen = "127.0.0.1:8787"
 	result.Data.Dir = "/var/lib/cellbridge"
 	result.Modem.Adapter = "auto"
+	result.Modem.Transport = "serial"
 	result.Modem.TTY = "auto"
 	result.Modem.Baud = 9600
+	result.SMS.InboxEnabled = true
 	result.Voice.Enabled = true
 	result.Voice.Backend = "auto"
 	result.Voice.Codec = "pcmu"
@@ -157,6 +165,12 @@ func (c Config) Validate() error {
 	}
 	if c.Modem.Baud != 9600 && c.Modem.Baud != 115200 {
 		return fmt.Errorf("modem.baud must be 9600 or 115200")
+	}
+	if c.Modem.Transport != "serial" && c.Modem.Transport != "usb-pty" {
+		return fmt.Errorf("modem.transport must be serial or usb-pty")
+	}
+	if c.Modem.Transport == "usb-pty" && !regexp.MustCompile(`^[1-9][0-9]*-[1-9][0-9]*(\.[1-9][0-9]*)*$`).MatchString(c.Modem.USBPath) {
+		return fmt.Errorf("usb-pty requires modem.usb_path pinned to a physical USB port, e.g. 1-2")
 	}
 	if c.Voice.Enabled && (c.Voice.Codec != "pcmu" || c.Voice.SampleRate != 8000) {
 		return fmt.Errorf("V1 voice requires pcmu at 8000 Hz")

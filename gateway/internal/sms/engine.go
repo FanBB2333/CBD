@@ -1,3 +1,5 @@
+// Portions adapted from dontmove-kit, Copyright (c) 2026 zxd (MIT).
+// See ThirdParty/dontmove-kit.LICENSE and ThirdParty/ThirdPartyNotices.md.
 package sms
 
 import (
@@ -44,7 +46,13 @@ func (e *Engine) Ingest(ctx context.Context, raw modem.RawSMS) (*db.Message, err
 		return nil, err
 	}
 	if exists {
-		return nil, nil
+		var linked bool
+		if err := e.Database.QueryRowContext(ctx, "SELECT message_id IS NOT NULL FROM sms_segments WHERE pdu_hash=?", hash).Scan(&linked); err != nil {
+			return nil, err
+		}
+		if linked {
+			return nil, nil
+		}
 	}
 	decoded, err := DecodePDU(hex.EncodeToString(raw.RawPDU))
 	if err != nil {
@@ -55,11 +63,13 @@ func (e *Engine) Ingest(ctx context.Context, raw modem.RawSMS) (*db.Message, err
 	if err != nil {
 		return nil, err
 	}
-	if err := e.Database.InsertSMSSegment(ctx, db.SMSSegment{
-		ID: segmentID, Sender: decoded.Sender, ConcatRef: decoded.ConcatRef, PartNo: decoded.PartNo,
-		TotalParts: decoded.TotalParts, RawPDU: raw.RawPDU, PDUHash: hash, ReceivedAt: receivedAt,
-	}); err != nil {
-		return nil, err
+	if !exists {
+		if err := e.Database.InsertSMSSegment(ctx, db.SMSSegment{
+			ID: segmentID, Sender: decoded.Sender, ConcatRef: decoded.ConcatRef, PartNo: decoded.PartNo,
+			TotalParts: decoded.TotalParts, RawPDU: raw.RawPDU, PDUHash: hash, ReceivedAt: receivedAt,
+		}); err != nil {
+			return nil, err
+		}
 	}
 	body := decoded.Body
 	encoding := decoded.Encoding
@@ -94,24 +104,40 @@ func (e *Engine) Ingest(ctx context.Context, raw modem.RawSMS) (*db.Message, err
 	}
 	threadKey := decoded.Sender
 	message := db.Message{ID: messageID, ThreadKey: threadKey, Direction: "inbound", Peer: decoded.Sender, Body: body, Encoding: string(encoding), Status: "sent", CreatedAt: receivedAt, ModemStorage: raw.ModemStorage, ModemIndex: &raw.ModemIndex, PDUHash: hash}
-	sequence, err := e.Database.InsertMessage(ctx, message)
+	hashes := []string{hash}
+	if completed != nil {
+		hashes = nil
+		for _, segment := range completed.Segments {
+			segmentHash := sha256.Sum256(segment.RawPDU)
+			hashes = append(hashes, hex.EncodeToString(segmentHash[:]))
+		}
+	}
+	sequence, err := e.Database.InsertMessage(ctx, message, hashes...)
 	if err != nil {
 		return nil, err
 	}
-	if completed == nil {
-		if err := e.Database.LinkSMSSegment(ctx, hash, messageID); err != nil {
-			return nil, err
-		}
-	} else {
-		for _, segment := range completed.Segments {
-			segmentHash := sha256.Sum256(segment.RawPDU)
-			if err := e.Database.LinkSMSSegment(ctx, hex.EncodeToString(segmentHash[:]), messageID); err != nil {
-				return nil, err
-			}
-		}
-	}
 	message.SyncSeq = sequence
 	return &message, nil
+}
+
+// persistStatus records a terminal submission status on its own deadline.
+//
+// The submission context is bounded (30s over SIP, 2min over HTTP) and by the
+// time the modem reports failure it is often already expired. Reusing it for
+// the status write made the write itself fail, so the row stayed at "queued"
+// forever and the client showed a permanently pending SMS that could never be
+// reconciled (observed 2026-09-09: six submissions stuck at queued after the
+// AT uplink died, none of them ever reaching failed/sent).
+func (e *Engine) persistStatus(message *db.Message, status string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sequence, err := e.Database.UpdateMessageStatus(ctx, message.ID, status)
+	if err != nil {
+		return err
+	}
+	message.Status = status
+	message.SyncSeq = sequence
+	return nil
 }
 
 func (e *Engine) Send(ctx context.Context, to, body string) (*db.Message, error) {
@@ -139,36 +165,24 @@ func (e *Engine) Send(ctx context.Context, to, body string) (*db.Message, error)
 		_, sendErr := e.Modem.SendSMS(ctx, to, modem.SMSPayload{Body: segment.Body, Encoding: string(segment.Encoding), PDU: segment.PDU, PartNo: segment.PartNo, Total: segment.Total})
 		if sendErr != nil {
 			if errors.Is(sendErr, modem.ErrSMSSubmissionUnknown) {
-				message.Status = "submitted"
-				if updatedSeq, updateErr := e.Database.UpdateMessageStatus(ctx, message.ID, message.Status); updateErr != nil {
-					return &message, fmt.Errorf("record uncertain SMS submission: %w", updateErr)
-				} else {
-					message.SyncSeq = updatedSeq
+				if statusErr := e.persistStatus(&message, "submitted"); statusErr != nil {
+					return &message, fmt.Errorf("record uncertain SMS submission: %w", statusErr)
 				}
 				slog.Warn("SMS submission result unknown after modem accepted PDU", "message_id", message.ID, "part", segment.PartNo, "total_parts", segment.Total, "error", sendErr)
 				return &message, nil
 			}
-			message.Status = "failed"
-			if updatedSeq, updateErr := e.Database.UpdateMessageStatus(ctx, message.ID, message.Status); updateErr != nil {
-				return &message, fmt.Errorf("record failed SMS submission: %w", updateErr)
-			} else {
-				message.SyncSeq = updatedSeq
+			if statusErr := e.persistStatus(&message, "failed"); statusErr != nil {
+				return &message, fmt.Errorf("record failed SMS submission: %w", statusErr)
 			}
 			slog.Warn("SMS PDU submission failed", "message_id", message.ID, "part", segment.PartNo, "total_parts", segment.Total, "error", sendErr)
 			return &message, fmt.Errorf("SMS submit failed: %w", sendErr)
 		}
-		message.Status = "submitted"
-		if updatedSeq, updateErr := e.Database.UpdateMessageStatus(ctx, message.ID, message.Status); updateErr != nil {
-			return &message, fmt.Errorf("record SMS submission: %w", updateErr)
-		} else {
-			message.SyncSeq = updatedSeq
+		if statusErr := e.persistStatus(&message, "submitted"); statusErr != nil {
+			return &message, fmt.Errorf("record SMS submission: %w", statusErr)
 		}
 	}
-	message.Status = "sent"
-	if updatedSeq, updateErr := e.Database.UpdateMessageStatus(ctx, message.ID, message.Status); updateErr != nil {
-		return &message, fmt.Errorf("record SMS sent status: %w", updateErr)
-	} else {
-		message.SyncSeq = updatedSeq
+	if statusErr := e.persistStatus(&message, "sent"); statusErr != nil {
+		return &message, fmt.Errorf("record SMS sent status: %w", statusErr)
 	}
 	return &message, nil
 }
@@ -201,20 +215,27 @@ func (e *Engine) Run(ctx context.Context, interval time.Duration, onMessage func
 				return ctx.Err()
 			}
 			// transient timeout/AT error: skip this round, keep cursor
+			slog.Warn("SMS inbox poll failed", "error", err)
 			return err
 		}
 		for _, raw := range messages {
 			delCtx, delCancel := context.WithTimeout(ctx, 10*time.Second)
 			message, ingestErr := e.Ingest(delCtx, raw)
 			if ingestErr != nil {
+				slog.Warn("SMS ingest failed; keeping modem message", "index", raw.ModemIndex, "error", ingestErr)
 				delCancel()
 				continue
 			}
-			if message != nil && onMessage != nil {
-				onMessage(message)
+			if message != nil {
+				slog.Info("SMS received", "message_id", message.ID, "encoding", message.Encoding)
+				if onMessage != nil {
+					onMessage(message)
+				}
 			}
 			if raw.ModemIndex > 0 {
-				_ = inbox.DeleteSMS(delCtx, fmt.Sprint(raw.ModemIndex))
+				if err := inbox.DeleteSMS(delCtx, fmt.Sprint(raw.ModemIndex)); err != nil {
+					slog.Warn("SMS modem cleanup failed", "index", raw.ModemIndex, "error", err)
+				}
 			}
 			delCancel()
 		}

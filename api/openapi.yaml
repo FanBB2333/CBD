@@ -494,7 +494,7 @@ components:
         id: { type: string }
         direction: { type: string, enum: [inbound, outbound] }
         peer: { type: string }
-        state: { type: string, enum: [idle, incoming_ringing, outgoing_dialing, connecting, active, ending, recovering] }
+        state: { type: string, enum: [idle, incoming_ringing, outgoing_dialing, connecting, active, ending, ended, recovering] }
         startedAt: { type: integer }
         connectedAt: { type: [integer, 'null'] }
         endedAt: { type: [integer, 'null'] }

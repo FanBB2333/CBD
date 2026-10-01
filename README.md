@@ -15,6 +15,9 @@
 
 ---
 
+> **CBD（CellBridge-Docker）/ QNAP：** 请从 [QNAP 容器部署与语音接入](docs/deployment/qnap.md) 开始。
+> 该适配参考 dontmove-kit；QNAP 正式容器已运行，USB AT、ADB、UAC、SIP 鉴权及一次 YakPhone 真实来电的双向声音已确认通过。出站通话、长通话及锁屏推送仍待验收；下文上游 fnOS 的结论不代表 QNAP 已通过这些测试。
+
 # CellBridge：QDC507 4G 模块 + NAS 网关 + YakPhone 全链路（语音/短信/来电）
 
 > 目标：让任何用户按照本文档，从零复刻一套"SIM 卡装在 QDC507 模块上，iPhone 通过 YakPhone 打 VoLTE 电话、收发短信"的完整系统。
@@ -611,7 +614,13 @@ curl -X POST http://127.0.0.1:8787/api/v1/messages \
 
 ## 10. PushKit 推送（来电/短信唤醒）
 
-YakPhone 官方推送端点（用户提供、仓库中提供参数格式）：
+> QNAP 当前部署状态（2026-10-01）：后台推送尚未启用。用户已开启 Tailscale VPN On Demand，
+> 但手机上的后台唤醒入口提示需要 YakPhone Pro。需先解锁或恢复相应权益，再取得该版本的推送接入配置。
+> 以下是仓库历史 token-only 接口格式；当前 YakPhone 官方介绍还提及 HMAC-SHA256 认证，
+> 不能仅填 token 就认定已兼容。须按应用提供的协议接入，并以锁屏真实呼入验证。
+> 当前进度见 [QNAP 部署记录](docs/deployment/qnap.md)。
+
+历史推送端点（用户提供、仓库中提供参数格式）：
 
 ```http
 POST https://push.yakteam.com/v1/notify

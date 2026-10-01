@@ -17,7 +17,7 @@ func configureSerialNative(ctx context.Context, path string, baud int) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	file, err := os.OpenFile(path, os.O_RDWR|unix.O_NONBLOCK, 0)
+	file, err := os.OpenFile(path, os.O_RDWR|unix.O_NONBLOCK|unix.O_NOCTTY, 0)
 	if err != nil {
 		return fmt.Errorf("open serial port for termios %s: %w", path, err)
 	}

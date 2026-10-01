@@ -1,7 +1,10 @@
+// Portions adapted from dontmove-kit, Copyright (c) 2026 zxd (MIT).
+// See ThirdParty/dontmove-kit.LICENSE and ThirdParty/ThirdPartyNotices.md.
 package at
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -25,6 +28,8 @@ type Adapter struct {
 	client *Client
 	mu     sync.Mutex
 	active modem.CallID
+	peer   string
+	closed bool
 	capMu  sync.RWMutex
 	caps   modem.Capabilities
 	events chan modem.ModemEvent
@@ -149,12 +154,20 @@ func (a *Adapter) WaitReady(ctx context.Context) error {
 }
 
 func (a *Adapter) Dial(ctx context.Context, peer string) (modem.CallID, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	callID := modem.CallID(uuid.NewString())
 	a.mu.Lock()
-	busy := a.active != ""
-	a.mu.Unlock()
-	if busy {
+	if a.active != "" || a.closed {
+		a.mu.Unlock()
 		return "", modem.ErrActiveCall
 	}
+	// Reserve the physical call before ATD, so an interleaved terminal URC
+	// cannot be lost and a concurrent dial cannot take the same line.
+	a.active, a.peer = callID, strings.TrimSpace(peer)
+	a.emitLocked(modem.ModemEvent{Kind: "outgoing", CallID: callID, Peer: a.peer})
+	a.mu.Unlock()
 	// After a NAS reboot the module's internal system boots on its own
 	// schedule (USB re-enumeration + Android userspace, which can take
 	// minutes). Sending ATD into a not-yet-ready modem just burns the
@@ -163,16 +176,18 @@ func (a *Adapter) Dial(ctx context.Context, peer string) (modem.CallID, error) {
 	// we reach here the AT channel is known to answer; keep ATD's own
 	// deadline tight so a mid-dial hang still fails fast.
 	if _, err := a.client.Exchange(ctx, "ATD"+strings.TrimSpace(peer)+";"); err != nil {
-		return "", err
+		if errors.Is(err, ErrCommandFailed) {
+			a.finishActive(callID, "dial_failed")
+			return "", err
+		}
+		// A timeout does not prove ATD failed. Keep ownership so the SIP
+		// teardown can explicitly release a potentially accepted call.
+		return callID, err
 	}
-	callID, err := id.New("call_", 16)
-	if err != nil {
-		return "", err
+	if err := a.validateActive(callID); err != nil {
+		return "", fmt.Errorf("call ended while dialing: %w", err)
 	}
-	a.mu.Lock()
-	a.active = modem.CallID(callID)
-	a.mu.Unlock()
-	return modem.CallID(callID), nil
+	return callID, nil
 }
 
 func (a *Adapter) Answer(ctx context.Context, callID modem.CallID) error {
@@ -187,11 +202,33 @@ func (a *Adapter) Hangup(ctx context.Context, callID modem.CallID) error {
 	if err := a.validateActive(callID); err != nil {
 		return err
 	}
-	_, err := a.client.Exchange(ctx, "ATH")
-	if err == nil {
-		a.finishActive(callID, "local_hangup")
+	_, err := a.client.Exchange(ctx, "AT+CHUP")
+	if errors.Is(err, ErrCommandFailed) {
+		_, err = a.client.Exchange(ctx, "ATH") // Explicit rejection only, never an unknown timeout.
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	// ATH can return OK while configured to ignore voice hangup. Confirm
+	// the voice leg has disappeared before publishing a completed call.
+	for {
+		if a.validateActive(callID) != nil {
+			return nil
+		}
+		lines, err := a.client.Exchange(ctx, "AT+CLCC")
+		if err != nil {
+			return fmt.Errorf("verify cellular hangup: %w", err)
+		}
+		if _, found := clccVoice(lines, modem.CLCCDirAny, 0, 1, 2, 3, 4, 5); !found {
+			a.finishActive(callID, "local_hangup")
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("voice call remains after hangup: %w", ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func (a *Adapter) SendDTMF(ctx context.Context, callID modem.CallID, digit rune) error {
@@ -206,28 +243,10 @@ func (a *Adapter) SendDTMF(ctx context.Context, callID modem.CallID, digit rune)
 }
 
 func (a *Adapter) SendSMS(ctx context.Context, destination string, payload modem.SMSPayload) (modem.SMSID, error) {
-	destination = strings.TrimSpace(destination)
-	if len(destination) <= 6 && payload.Body != "" {
-		if _, err := a.client.Exchange(ctx, "AT+CMGF=1"); err != nil {
-			return "", err
-		}
-		if _, err := a.client.Exchange(ctx, "AT+CSCS=\"GSM\""); err != nil {
-			return "", err
-		}
-		if _, err := a.client.SendTextSMS(ctx, destination, payload.Body); err != nil {
-			if errors.Is(err, ErrSubmissionResultUnknown) {
-				return "", fmt.Errorf("%w: %v", modem.ErrSMSSubmissionUnknown, err)
-			}
-			return "", err
-		}
-		messageID, err := id.New("sms_", 16)
-		return modem.SMSID(messageID), err
-	}
+	// Use the engine's encoded PDU for short codes as well: text mode with
+	// CSCS=GSM corrupts Chinese and loses multipart headers.
 	if payload.PDU == "" {
 		return "", fmt.Errorf("SMS PDU is required")
-	}
-	if _, err := a.client.Exchange(ctx, "AT+CMGF=0"); err != nil {
-		return "", err
 	}
 	pduBytes := len(strings.TrimSpace(payload.PDU)) / 2
 	if pduBytes < 2 {
@@ -259,13 +278,7 @@ func (a *Adapter) ListSMS(ctx context.Context, cursor modem.SMSCursor) ([]modem.
 	// in MT — so messages are never ingested, pushed, or deleted.
 	// Observed 2026-09-06: +CPMS showed "MT",2,23 but CMGL=4 returned
 	// nothing; user stopped receiving SMS entirely.
-	if _, err := a.client.Exchange(ctx, "AT+CPMS=\"MT\""); err != nil {
-		return nil, cursor, err
-	}
-	if _, err := a.client.Exchange(ctx, "AT+CMGF=0"); err != nil {
-		return nil, cursor, err
-	}
-	lines, err := a.client.Exchange(ctx, "AT+CMGL=4")
+	lines, err := a.client.ExchangeSequence(ctx, "AT+CPMS=\"MT\"", "AT+CMGF=0", "AT+CMGL=4")
 	if err != nil {
 		return nil, cursor, err
 	}
@@ -274,15 +287,17 @@ func (a *Adapter) ListSMS(ctx context.Context, cursor modem.SMSCursor) ([]modem.
 	lastIndex := strings.TrimSpace(string(cursor))
 	for _, line := range lines {
 		if strings.HasPrefix(line, "+CMGL:") {
+			current = nil
 			fields := strings.Split(strings.TrimSpace(strings.TrimPrefix(line, "+CMGL:")), ",")
-			if len(fields) == 0 {
+			if len(fields) < 2 || (strings.TrimSpace(fields[1]) != "0" && strings.TrimSpace(fields[1]) != "1") {
+				// Leave stored drafts and outgoing messages untouched.
 				continue
 			}
 			index, parseErr := strconv.Atoi(strings.TrimSpace(fields[0]))
 			if parseErr != nil {
 				continue
 			}
-			current = &modem.RawSMS{ModemStorage: "SM", ModemIndex: index}
+			current = &modem.RawSMS{ModemStorage: "MT", ModemIndex: index}
 			lastIndex = strconv.Itoa(index)
 			continue
 		}
@@ -302,10 +317,11 @@ func (a *Adapter) DeleteSMS(ctx context.Context, storageIndex string) error {
 	// CMGD without an explicit storage deletes from the *current
 	// preferred* storage; pin it to MT (same reason as ListSMS) so
 	// engine.go's post-ingest cleanup actually removes the message.
-	if _, err := a.client.Exchange(ctx, "AT+CPMS=\"MT\""); err != nil {
-		return err
+	index, err := strconv.Atoi(storageIndex)
+	if err != nil || index < 1 {
+		return fmt.Errorf("invalid SMS storage index")
 	}
-	if _, err := a.client.Exchange(ctx, "AT+CMGD="+strings.TrimSpace(storageIndex)); err != nil {
+	if _, err := a.client.ExchangeSequence(ctx, "AT+CPMS=\"MT\"", fmt.Sprintf("AT+CMGD=%d", index)); err != nil {
 		return err
 	}
 	return nil
@@ -313,35 +329,132 @@ func (a *Adapter) DeleteSMS(ctx context.Context, storageIndex string) error {
 
 func (a *Adapter) Events() <-chan modem.ModemEvent { return a.events }
 
-// WaitActive polls AT+CLCC until the outgoing call is answered (dir=0,
-// state=0 active) or the context ends. Opening UAC capture before the
+// clccActive reports whether the +CLCC lines describe a call in the given
+// direction that has reached state 0 (active). dir < 0 matches either
+// direction. Kept separate from the polling loop so the direction matching
+// is unit-testable without a live modem.
+func clccActive(lines []string, dir int) bool {
+	_, found := clccVoice(lines, dir, 0)
+	return found
+}
+
+// QDC507 also lists empty data legs as active. Only mode=0 is a voice
+// call; accepting mode=1 can start capture before the caller has answered.
+func clccVoice(lines []string, dir int, states ...int) (string, bool) {
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "+CLCC:") {
+			continue
+		}
+		// +CLCC: <id>,<dir>,<state>,<mode>,<mpty>,<number>,<type>
+		reader := csv.NewReader(strings.NewReader(strings.TrimSpace(strings.TrimPrefix(line, "+CLCC:"))))
+		reader.TrimLeadingSpace = true
+		fields, err := reader.Read()
+		if err != nil || len(fields) < 5 {
+			continue
+		}
+		callDir, dirErr := strconv.Atoi(strings.TrimSpace(fields[1]))
+		state, stateErr := strconv.Atoi(strings.TrimSpace(fields[2]))
+		mode, modeErr := strconv.Atoi(strings.TrimSpace(fields[3]))
+		if dirErr != nil || stateErr != nil || modeErr != nil || mode != 0 || callDir < 0 || callDir > 1 {
+			continue
+		}
+		for _, wanted := range states {
+			if state == wanted && (dir < 0 || callDir == dir) {
+				peer := ""
+				if len(fields) >= 7 {
+					peer = callerNumber(fields[5], fields[6])
+				}
+				return peer, true
+			}
+		}
+	}
+	return "", false
+}
+
+func callerNumber(number, kind string) string {
+	number = strings.TrimSpace(number)
+	if number != "" && strings.TrimSpace(kind) == "145" && !strings.HasPrefix(number, "+") {
+		number = "+" + number
+	}
+	return number
+}
+
+// CallerNumber is a bounded read-only fallback when RING precedes +CLIP.
+func (a *Adapter) CallerNumber(ctx context.Context) (string, error) {
+	a.mu.Lock()
+	callID, peer := a.active, a.peer
+	a.mu.Unlock()
+	if callID == "" || peer != "" {
+		return peer, nil
+	}
+	lines, err := a.client.Exchange(ctx, "AT+CLCC")
+	if err != nil {
+		return "", err
+	}
+	if peer, found := clccVoice(lines, modem.CLCCDirIncoming, 0, 4, 5); found {
+		a.updatePeer(callID, peer)
+		return peer, nil
+	}
+	return "", nil
+}
+
+func (a *Adapter) updatePeer(callID modem.CallID, peer string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if callID != "" && a.active == callID && peer != "" && peer != a.peer {
+		a.peer = peer
+		a.emitLocked(modem.ModemEvent{Kind: "caller_id", CallID: callID, Peer: peer})
+	}
+}
+
+// WaitActive polls AT+CLCC until an outgoing call is answered. Kept for the
+// dial path; inbound uses WaitActiveDir with dir=1.
+func (a *Adapter) WaitActive(ctx context.Context) (bool, error) {
+	return a.WaitActiveDir(ctx, modem.CLCCDirOutgoing)
+}
+
+// WaitActiveDir polls AT+CLCC until a call in the given direction reaches
+// state 0 (active), or the context ends. Opening UAC capture before the
 // cellular leg is active wedges the ALSA ASYNC stream into an XRUN that
 // reads silence forever, so the SIP bridge must wait for this before
 // starting audio.
-func (a *Adapter) WaitActive(ctx context.Context) (bool, error) {
+//
+// Upstream hard-coded dir=0 here. An inbound (mobile terminated) call is
+// reported with dir=1, so the answer path could never confirm the pickup:
+// it blocked for its entire deadline and only then started the audio
+// bridge — by which time the caller had already hung up. Every answered
+// inbound call was silent while outbound worked, because outbound really is
+// dir=0.
+func (a *Adapter) WaitActiveDir(ctx context.Context, dir int) (bool, error) {
+	a.mu.Lock()
+	callID := a.active
+	a.mu.Unlock()
+	var lastSeen []string
 	for {
+		if callID == "" || a.validateActive(callID) != nil {
+			return false, modem.ErrNoActiveCall
+		}
 		select {
 		case <-ctx.Done():
+			slog.Warn("clcc wait timed out", "dir", dir, "last_clcc", lastSeen)
 			return false, ctx.Err()
 		default:
 		}
 		lines, err := a.client.Exchange(ctx, "AT+CLCC")
 		if err == nil {
-			for _, line := range lines {
-				// +CLCC: <id>,<dir>,<state>,... — answered is dir=0 outgoing, state=0 active
-				if strings.HasPrefix(line, "+CLCC:") {
-					fields := strings.Split(strings.TrimPrefix(line, "+CLCC:"), ",")
-					if len(fields) >= 3 && strings.TrimSpace(fields[1]) == "0" && strings.TrimSpace(fields[2]) == "0" {
-						return true, nil
-					}
-				}
+			if peer, active := clccVoice(lines, dir, 0); active {
+				a.updatePeer(callID, peer)
+				slog.Info("clcc call active", "dir", dir, "lines", lines)
+				return true, nil
 			}
+			lastSeen = lines
 		}
 		timer := time.NewTimer(300 * time.Millisecond)
 		select {
 		case <-timer.C:
 		case <-ctx.Done():
 			timer.Stop()
+			slog.Warn("clcc wait timed out", "dir", dir, "last_clcc", lastSeen)
 			return false, ctx.Err()
 		}
 	}
@@ -358,51 +471,55 @@ func (a *Adapter) Run(ctx context.Context) error {
 // command exchange. It is public so a platform-specific reader can preserve
 // unsolicited RING/NO CARRIER events without coupling it to the parser.
 func (a *Adapter) HandleURC(line string) {
-	// A URC may arrive exactly as Close() shuts the events channel
-	// down (observed as a restart-time panic: "send on closed
-	// channel"). Swallow it instead of crashing the gateway.
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			slog.Warn("adapter URC dropped during shutdown", "cause", recovered)
-		}
-	}()
 	line = strings.TrimSpace(line)
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return
+	}
 	callID := a.active
-	a.mu.Unlock()
 	var event modem.ModemEvent
 	switch {
-	case line == "RING":
+	case line == "RING", strings.HasPrefix(line, "+CLIP:"):
+		peer := ""
+		if strings.HasPrefix(line, "+CLIP:") {
+			reader := csv.NewReader(strings.NewReader(strings.TrimSpace(strings.TrimPrefix(line, "+CLIP:"))))
+			reader.TrimLeadingSpace = true
+			fields, err := reader.Read()
+			if err != nil || len(fields) < 2 {
+				return
+			}
+			peer = callerNumber(fields[0], fields[1])
+		}
 		if callID == "" {
 			callID = modem.CallID(uuid.NewString())
-			a.mu.Lock()
-			a.active = callID
-			a.mu.Unlock()
+			a.active, a.peer = callID, ""
 		}
-		event = modem.ModemEvent{Kind: "incoming", CallID: callID}
+		if peer != "" {
+			a.peer = peer
+		}
+		event = modem.ModemEvent{Kind: "incoming", CallID: callID, Peer: a.peer}
 	case strings.Contains(line, "NO CARRIER"), strings.Contains(line, "BUSY"), strings.Contains(line, "NO ANSWER"):
 		event = modem.ModemEvent{Kind: "ended", CallID: callID, Raw: line}
 		// The modem terminated the call (e.g. an unanswered inbound call).
 		// Clear the active marker here, or every later dial fails with
 		// ErrActiveCall until the process restarts.
-		a.mu.Lock()
 		if a.active == callID && callID != "" {
-			a.active = ""
+			a.active, a.peer = "", ""
 		}
-		a.mu.Unlock()
 	default:
 		return
 	}
-	select {
-	case a.events <- event:
-	default:
-	}
+	a.emitLocked(event)
 }
 
 func (a *Adapter) Close() error {
 	var err error
 	a.close.Do(func() {
+		a.mu.Lock()
+		a.closed = true
 		close(a.events)
+		a.mu.Unlock()
 		if a.client != nil {
 			err = a.client.Close()
 		}
@@ -415,20 +532,28 @@ func (a *Adapter) validateActive(callID modem.CallID) error {
 	active := a.active
 	a.mu.Unlock()
 	if active == "" || (callID != "" && active != callID) {
-		return fmt.Errorf("active call mismatch")
+		return fmt.Errorf("%w: active call mismatch", modem.ErrNoActiveCall)
 	}
 	return nil
 }
 
 func (a *Adapter) finishActive(callID modem.CallID, reason string) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.active == callID {
-		a.active = ""
+		a.active, a.peer = "", ""
+		a.emitLocked(modem.ModemEvent{Kind: "ended", CallID: callID, Raw: reason})
 	}
-	a.mu.Unlock()
+}
+
+func (a *Adapter) emitLocked(event modem.ModemEvent) {
+	if a.closed {
+		return
+	}
 	select {
-	case a.events <- modem.ModemEvent{Kind: "ended", CallID: callID, Raw: reason}:
+	case a.events <- event:
 	default:
+		slog.Error("modem event queue full", "kind", event.Kind, "call_id", event.CallID)
 	}
 }
 

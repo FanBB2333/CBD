@@ -23,10 +23,11 @@ import (
 	"github.com/cellbridge/cellbridge/gateway/internal/modem"
 	"github.com/cellbridge/cellbridge/gateway/internal/modem/at"
 	"github.com/cellbridge/cellbridge/gateway/internal/modem/discovery"
+	"github.com/cellbridge/cellbridge/gateway/internal/modem/usbpty"
 	"github.com/cellbridge/cellbridge/gateway/internal/push"
 	"github.com/cellbridge/cellbridge/gateway/internal/recording"
-	"github.com/cellbridge/cellbridge/gateway/internal/sms"
 	"github.com/cellbridge/cellbridge/gateway/internal/sip"
+	"github.com/cellbridge/cellbridge/gateway/internal/sms"
 	"github.com/cellbridge/cellbridge/gateway/internal/voice"
 	qdc507voice "github.com/cellbridge/cellbridge/gateway/internal/voice/qdc507"
 	"github.com/cellbridge/cellbridge/gateway/internal/webrtc"
@@ -147,9 +148,30 @@ func main() {
 		go recorder.RunRetention(shutdownContext)
 	}
 
-	serialAdapter, serialErr := openConfiguredModem(settings.Modem.TTY, settings.Modem.Baud)
+	modemTTY := settings.Modem.TTY
+	if settings.Modem.Transport == "usb-pty" {
+		// Keep AT available during deferred SIP hangup. Cancelling the USB
+		// helper on SIGTERM first made Hangup time out and orphaned the call.
+		// The deferred bridge.Close below runs after SIP/serial cleanup.
+		bridge, bridgeErr := usbpty.Start(context.WithoutCancel(shutdownContext), settings.Modem.USBPath)
+		if bridgeErr != nil {
+			slog.Error("USB AT bridge unavailable", "error", bridgeErr)
+			return
+		}
+		defer bridge.Close()
+		modemTTY = bridge.TTY
+		slog.Info("USB AT bridge ready", "usb_path", settings.Modem.USBPath, "tty", modemTTY)
+		go func() {
+			<-bridge.Done()
+			if shutdownContext.Err() == nil {
+				slog.Error("USB AT bridge exited; stopping gateway", "error", bridge.Err())
+				stop()
+			}
+		}()
+	}
+	serialAdapter, serialErr := openConfiguredModem(modemTTY, settings.Modem.Baud)
 	if serialErr != nil {
-		if settings.Modem.TTY == "auto" {
+		if settings.Modem.Transport == "serial" && settings.Modem.TTY == "auto" {
 			slog.Warn("no usable modem found; gateway will run without cellular I/O", "error", serialErr)
 		} else {
 			slog.Error("open configured modem", "error", serialErr)
@@ -202,7 +224,8 @@ func main() {
 				slog.Warn("open QDC507 host ALSA backend; voice remains unavailable", "error", audioErr)
 			} else {
 				voiceAudio, audioErr = qdc507voice.Open(hostAudio, qdc507voice.Config{
-					TTY:        settings.Modem.TTY,
+					TTY:        modemTTY,
+					USBPath:    settings.Modem.USBPath,
 					RuntimeDir: settings.Voice.RuntimeDir,
 					Bootstrap:  settings.Voice.Bootstrap,
 				})
@@ -242,16 +265,28 @@ func main() {
 		}
 		application.SetCapabilities(capabilities)
 		application.SMSEngine = sms.NewEngine(database, serialAdapter)
-		go func() {
-			if runErr := application.SMSEngine.Run(shutdownContext, 5*time.Second, application.HandleMessage); runErr != nil && runErr != context.Canceled {
-				slog.Warn("SMS inbox reader stopped", "error", runErr)
-			}
-		}()
+		if settings.SMS.InboxEnabled {
+			slog.Info("SMS inbox polling enabled", "interval", "5s")
+			go func() {
+				if runErr := application.SMSEngine.Run(shutdownContext, 5*time.Second, application.HandleMessage); runErr != nil && runErr != context.Canceled {
+					slog.Warn("SMS inbox reader stopped", "error", runErr)
+				}
+			}()
+		} else {
+			slog.Info("SMS inbox polling disabled; modem messages remain untouched")
+		}
 		callModem := modem.NewActiveCallAdapter(serialAdapter)
 		defer callModem.Close()
 		application.CallModem = callModem
+		apiEvents := make(chan modem.ModemEvent, 32)
+		sipEvents := make(chan modem.ModemEvent, 32)
+		sinks := []chan modem.ModemEvent{apiEvents}
+		if settings.SIP.Enabled {
+			sinks = append(sinks, sipEvents)
+		}
+		go modem.FanOut(callModem.Events(), sinks...)
 		go func() {
-			for event := range callModem.Events() {
+			for event := range apiEvents {
 				application.HandleModemEvent(event)
 			}
 		}()
@@ -284,24 +319,23 @@ func main() {
 				sipAuth.AddUser(u.Username, u.Password)
 			}
 			sipServer := sip.NewServer(settings.SIP.Listen, registrar, sipAuth, callModem, application.VoiceAudio)
+			sipServer.AttachCallEvents(application.HandleModemEvent)
 			application.YakPushToken = settings.SIP.PushToken
-			sipServer.AttachEvents(callModem.Events(), settings.SIP.PushToken)
+			sipServer.AttachEvents(sipEvents, settings.SIP.PushToken)
 			if application.SMSEngine != nil {
-				sipServer.AttachSMS(func(ctx context.Context, to, body string) error {
-					_, err := application.SMSEngine.Send(ctx, to, body)
-					return err
-				})
+				sipServer.AttachSMS(application.SMSEngine.SendOnce)
 			}
 			if err := sipServer.Start(shutdownContext); err != nil {
 				slog.Error("start SIP server", "error", err)
 			} else {
 				defer sipServer.Stop(context.Background())
+				go sipServer.RunSMSDelivery(shutdownContext, database)
 				slog.Info("SIP gateway listening", "addr", settings.SIP.Listen)
 			}
 		}
 	}
 
-server := &http.Server{
+	server := &http.Server{
 		Addr:              settings.Server.Listen,
 		Handler:           application.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,

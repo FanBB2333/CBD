@@ -148,7 +148,7 @@ func TestCallAPIIsIdempotentAndPersistsState(t *testing.T) {
 	getRequest := httptest.NewRequest(http.MethodGet, "/api/v1/calls/"+created.ID, nil)
 	getRequest.Header.Set("Authorization", "Bearer "+accessToken)
 	handler.ServeHTTP(get, getRequest)
-	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"state":"ending"`) {
+	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"state":"ended"`) {
 		t.Fatalf("get call = %d: %s", get.Code, get.Body.String())
 	}
 	list := httptest.NewRecorder()

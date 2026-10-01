@@ -12,7 +12,7 @@ type fakeCallControl struct {
 }
 
 func (f *fakeCallControl) Probe(context.Context) (Capabilities, error) { return Capabilities{}, nil }
-func (f *fakeCallControl) WaitReady(context.Context) error              { return nil }
+func (f *fakeCallControl) WaitReady(context.Context) error             { return nil }
 func (f *fakeCallControl) Status(context.Context) (LineStatus, error)  { return LineStatus{}, nil }
 func (f *fakeCallControl) Dial(context.Context, string) (CallID, error) {
 	f.last = "physical-1"
@@ -62,5 +62,22 @@ func TestActiveCallAdapterMapsIncomingAndEndedHandles(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for ended event")
+	}
+}
+
+func TestLatePreviousEndCannotClearNextCall(t *testing.T) {
+	control := &fakeCallControl{events: make(chan ModemEvent, 8)}
+	a := NewActiveCallAdapter(control)
+	defer a.Close()
+	control.events <- ModemEvent{Kind: "outgoing", CallID: "first"}
+	<-a.Events()
+	control.events <- ModemEvent{Kind: "ended", CallID: "first"}
+	<-a.Events()
+	control.events <- ModemEvent{Kind: "incoming", CallID: "second"}
+	<-a.Events()
+	control.events <- ModemEvent{Kind: "ended", CallID: "first"}
+	<-a.Events()
+	if a.PhysicalCallID() != "second" {
+		t.Fatal("stale terminal event cleared the new call")
 	}
 }

@@ -918,7 +918,7 @@ type Change struct {
 	Operation  string `json:"op"`
 }
 
-func (database *DB) InsertMessage(ctx context.Context, message Message) (int64, error) {
+func (database *DB) InsertMessage(ctx context.Context, message Message, segmentHashes ...string) (int64, error) {
 	transaction, err := database.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -935,6 +935,13 @@ func (database *DB) InsertMessage(ctx context.Context, message Message) (int64, 
 		nullTime(message.ServiceTime), message.CreatedAt.UnixMilli(), message.ModemStorage, nullInt(message.ModemIndex), nullString(message.PDUHash), sequence)
 	if err != nil {
 		return 0, fmt.Errorf("insert message: %w", err)
+	}
+	// Received message and its segment ownership commit together. A crash
+	// cannot leave a segment marked complete without its visible message.
+	for _, hash := range segmentHashes {
+		if _, err := transaction.ExecContext(ctx, `UPDATE sms_segments SET message_id=? WHERE pdu_hash=? AND message_id IS NULL`, message.ID, hash); err != nil {
+			return 0, err
+		}
 	}
 	if err := transaction.Commit(); err != nil {
 		return 0, err

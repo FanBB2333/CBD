@@ -82,10 +82,17 @@ func queryIMS(ctx context.Context, exchanger Exchanger) (bool, bool, error) {
 			continue
 		}
 		fields := strings.Split(line, ",")
-		if len(fields) < 3 {
+		if len(fields) != 3 {
 			return false, false, fmt.Errorf("invalid QDC507 IMS response %q", line)
 		}
-		return strings.TrimSpace(fields[1]) == "1" && strings.TrimSpace(fields[2]) == "1", true, nil
+		configuration, configErr := strconv.Atoi(strings.TrimSpace(fields[1]))
+		capability, capabilityErr := strconv.Atoi(strings.TrimSpace(fields[2]))
+		if configErr != nil || capabilityErr != nil || configuration < 0 || configuration > 2 || capability < 0 || capability > 1 {
+			return false, false, fmt.Errorf("invalid QDC507 IMS values %q", line)
+		}
+		// Quectel QCFG: 0 follows the MBN default, 1 forces IMS on, 2 forces
+		// it off. The second field is VoLTE capability, not IMS registration.
+		return configuration != 2 && capability == 1, true, nil
 	}
 	return false, false, fmt.Errorf("QDC507 IMS capability was not reported")
 }

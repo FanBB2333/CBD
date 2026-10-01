@@ -38,6 +38,8 @@ import (
 )
 
 type Server struct {
+	callEventMu       sync.Mutex
+	callPersistMu     sync.Mutex
 	GatewayID         string
 	Name              string
 	Version           string
@@ -796,13 +798,8 @@ func (s *Server) dial(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.CallModem.Dial(r.Context(), request.To); err != nil {
 		slog.Warn("modem dial failed", "request_id", requestID, "call_id", current.ID, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
-		if errors.Is(err, modem.ErrActiveCall) {
-			if cleanupErr := s.CallModem.Hangup(r.Context()); cleanupErr != nil {
-				slog.Warn("stale modem call cleanup failed", "request_id", requestID, "error", cleanupErr)
-			} else {
-				slog.Info("stale modem call cleaned after dial rejection", "request_id", requestID)
-			}
-		}
+		// A busy rejection belongs to another physical call. The modem
+		// adapter cleans up only uncertain legs created by this request.
 		_, _, _ = s.CallControl.Hangup("modem-failure:"+requestID, current.ID, "modem_dial_failed")
 		if ended, _, finishErr := s.CallControl.Finish(current.ID); finishErr == nil {
 			current = ended
@@ -1557,9 +1554,22 @@ func (s *Server) privateTURNServer(now time.Time, subject string) (iceServerResp
 }
 
 func (s *Server) persistCall(ctx context.Context, current call.Call, event call.Event) (int64, error) {
+	s.callPersistMu.Lock()
+	defer s.callPersistMu.Unlock()
+	if s.Database != nil && current.EndedAt == nil {
+		stored, err := s.Database.GetCall(ctx, current.ID)
+		if err == nil && stored.EndedAt != nil {
+			return stored.SyncSeq, nil // A delayed HTTP snapshot cannot reopen a call.
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return 0, err
+		}
+	}
 	s.lineMu.Lock()
 	if current.EndedAt != nil {
-		s.Line.ActiveCallID = nil
+		if s.Line.ActiveCallID != nil && string(*s.Line.ActiveCallID) == current.ID {
+			s.Line.ActiveCallID = nil
+		}
 	} else {
 		callID := modem.CallID(current.ID)
 		s.Line.ActiveCallID = &callID
@@ -1606,17 +1616,47 @@ func (s *Server) closeWebRTC(callID string) {
 // persisted call state machine. It is safe to call from the modem reader
 // goroutine; all HTTP/event work is kept out of the serial parser.
 func (s *Server) HandleModemEvent(event modem.ModemEvent) {
+	s.callEventMu.Lock()
+	defer s.callEventMu.Unlock()
 	if s.CallControl == nil {
 		return
 	}
+	callID := string(event.CallID)
+	if callID == "" {
+		return
+	}
+	// Late RING/CLIP events must not recreate an already completed call.
+	if s.Database != nil {
+		if stored, err := s.Database.GetCall(context.Background(), callID); err == nil && stored.EndedAt != nil {
+			return
+		}
+	}
+	persist := func(current call.Call, stateEvent call.Event, err error) {
+		if err == nil {
+			if _, err := s.persistCall(context.Background(), current, stateEvent); err != nil {
+				slog.Error("persist call event", "call_id", callID, "kind", event.Kind, "error", err)
+			}
+		}
+	}
 	switch event.Kind {
 	case "incoming":
-		current, stateEvent, err := s.CallControl.Incoming(string(event.CallID), event.Peer)
+		current, stateEvent, err := s.CallControl.Incoming(callID, event.Peer)
 		if err == nil {
 			if _, persistErr := s.persistCall(context.Background(), current, stateEvent); persistErr == nil {
 				s.sendIncomingCallPush(current)
 			}
+		} else if errors.Is(err, call.ErrDuplicateEvent) {
+			persist(s.CallControl.UpdatePeer(callID, event.Peer))
 		}
+	case "outgoing":
+		if current := s.CallControl.Snapshot(); current != nil && current.ID == callID {
+			return // HTTP already created this logical call.
+		}
+		persist(s.CallControl.Dial("modem-dial:"+callID, callID, event.Peer))
+	case "caller_id":
+		persist(s.CallControl.UpdatePeer(callID, event.Peer))
+	case "connected":
+		persist(s.CallControl.Connected(callID))
 	case "ended":
 		current, stateEvent, err := s.CallControl.RemoteEnded(string(event.CallID), event.Raw)
 		if err != nil {

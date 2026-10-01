@@ -6,6 +6,36 @@ import (
 	"testing"
 )
 
+func TestUSBTransportRequiresPhysicalPort(t *testing.T) {
+	for _, path := range []string{"", "auto", "../1-2", "1-2/other", "0-0"} {
+		cfg := Default()
+		cfg.Modem.Transport = "usb-pty"
+		cfg.Modem.USBPath = path
+		if cfg.Validate() == nil {
+			t.Fatalf("unsafe or ambiguous USB path accepted: %q", path)
+		}
+	}
+	cfg := Default()
+	cfg.Modem.Transport = "usb-pty"
+	cfg.Modem.USBPath = "1-2.3"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestQNAPTemplateLoadsWithDevicesDisabledUntilVerified(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "..", "infra", "config.qnap.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Modem.Transport != "usb-pty" || cfg.Modem.USBPath != "1-2" {
+		t.Fatal("QNAP template does not select the pinned USB transport")
+	}
+	if cfg.Voice.Enabled || cfg.Voice.Bootstrap || cfg.SIP.Enabled || cfg.SMS.InboxEnabled || cfg.Network.PublicFallback {
+		t.Fatal("QNAP template enables an unverified service")
+	}
+}
+
 func TestLoadPlanConfiguration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	content := []byte("server:\n  listen: 127.0.0.1:9090\ndata:\n  dir: /tmp/cellbridge\nvoice:\n  enabled: true\n  codec: pcmu\n  sample_rate: 8000\nsecurity:\n  pairing_local_only: true\n")
