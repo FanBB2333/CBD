@@ -402,6 +402,41 @@ QNAP 真机硬件测试（北京时间 19:10）通过：准备路由后不启动
 NAS 默认路由仍为家庭网关，模块 `usb0` 为 DOWN，收发计数均为 0。
 此时手机尚未重新注册；已请用户打开 YakPhone 后复测两次真实拨号、双向声音及挂断。
 
+### 上行语音延迟与静音插帧
+
+用户确认 Linphone、YakPhone 均能通话，但手机发言在对端延迟约 1–3 秒且音质差，
+接听对端语音相对正常。2026-10-01 20:30 起排查发现：
+
+- 原 ALSA 播放环为 8192 样本，8kHz 下约 1024ms；[aplay 1.2.8](https://github.com/alsa-project/alsa-utils/blob/v1.2.8/aplay/aplay.c)
+  默认填满环后启动，
+  配合 1024 样本的 128ms 传输周期，会明显增加上行等待。
+- bridge 已按 20ms 节拍写入语音或补充静音，ALSA 的 primeLoop 又按独立节拍、
+  “距上次写入超过 15ms”的条件写静音。自动化用旧实现复现了语音帧之间插入零帧。
+- 上层队列最多保存 50 帧（1 秒），没有按帧年龄淘汰；声卡阻塞时还会持有 RTP 回调需要的锁。
+
+修复：ALSA 采用 160 样本（20ms）周期、640 样本（80ms）环，播放启动阈值 40ms；
+primeLoop 只负责启动预填充，第一次 WritePCM 后将写入节奏完全交给 bridge。
+上层保留短抖动缓冲，最多 6 帧（120ms），溢出恢复至 3 帧并丢弃超过 120ms 的旧帧。
+声卡写入不再占用 RTP 回调锁，Stop 可以关闭设备以中断阻塞写；旧写入退出后才能让下一通接管。
+日志新增 queue_ms、queue_peak_ms、dropped、underruns，并保留 ALSA 工具的 XRUN 诊断。
+
+Go 全量测试、voice/SIP/modem 竞态测试及 go vet 通过。回归覆盖重复静音、突发积压、
+过期帧、缺帧恢复，以及声卡阻塞时继续接收 RTP 和及时挂断。
+QNAP 硬件验证于 20:37 通过：两轮独立路由均采集 8000 个空闲样本；
+随后用生产 bridge 和合成 PCM 连续运行 10 秒，收到 499 帧采集数据，播放内核延迟 21–41ms，
+上层队列在日志采样时为 20–40ms、峰值 60ms，dropped=0、underruns=0，无 ALSA XRUN 日志。
+硬件实际参数确认为双向 S16_LE、mono、8000Hz、period_size=160、buffer_size=640。
+测试结束两路 PCM 均 closed，旧服务自动恢复；期间不拨号、不发短信，SIM 的 usb0 仍保持关闭。
+
+20:39:45 已部署镜像 `499a9c7619e0`，容器 healthy、重启计数 0，数据库 quick_check=ok，
+未结束通话为 0。只读 SIP 验证正确密码 200、错误密码 401，未修改客户端绑定。
+旧日志保存在 NAS `cbd/data/before-uplink-latency-20261001.log`；SIM usb0 为 DOWN、RX/TX 均为 0。
+
+以上延迟只反映网关声卡和应用缓冲，不是手机到对方的全程测量。
+部署后用户通过真实通话确认延迟已明显改善。对端音质及超过 60 秒连续交谈的稳定性
+尚未获得单独确认，保留为后续验收项。
+回滚镜像保留为 `cellbridge-gateway:pre-uplink-latency-20261001`。
+
 ## 保留的语音逻辑与后续验收
 
 已接入 dontmove-kit 的 Contact/ACK/RTP 地址处理、CLCC 来电方向判定、

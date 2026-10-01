@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"time"
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cellbridge/cellbridge/gateway/internal/modem"
 )
@@ -27,16 +27,16 @@ type ALSAAudio struct {
 	captureDevice  string
 	playbackDevice string
 
-	mu       sync.Mutex
-	call     modem.CallID
-	capture  *exec.Cmd
-	playback *exec.Cmd
-	rx       io.ReadCloser
-	tx       io.WriteCloser
-	txMu     sync.Mutex
-	primeStop chan struct{}
-	lastWrite time.Time
-	once     sync.Once
+	mu            sync.Mutex
+	call          modem.CallID
+	capture       *exec.Cmd
+	playback      *exec.Cmd
+	rx            io.ReadCloser
+	tx            io.WriteCloser
+	txMu          sync.Mutex
+	primeStop     chan struct{}
+	playbackOwned bool // the bridge owns pacing after its first WritePCM
+	once          sync.Once
 }
 
 func OpenALSA(captureDevice, playbackDevice string) (*ALSAAudio, error) {
@@ -112,13 +112,17 @@ func (a *ALSAAudio) Start(ctx context.Context, callID modem.CallID) error {
 	// Kill any stale pair outside the lock.
 	reap(capture)
 	reap(playback)
-	if rx != nil { _ = rx.Close() }
-	if tx != nil { _ = tx.Close() }
+	if rx != nil {
+		_ = rx.Close()
+	}
+	if tx != nil {
+		_ = tx.Close()
+	}
 
-	newCapture := exec.Command("arecord", "-q", "-D", a.captureDevice, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(SampleRate), "-c", fmt.Sprint(Channels), "--buffer-size=8192", "--period-size=1024")
-	newPlayback := exec.Command("aplay", "-q", "-D", a.playbackDevice, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(SampleRate), "-c", fmt.Sprint(Channels), "--buffer-size=8192", "--period-size=1024")
-	newCapture.Stderr = io.Discard
-	newPlayback.Stderr = io.Discard
+	newCapture := exec.Command("arecord", alsaArgs(a.captureDevice, false)...)
+	newPlayback := exec.Command("aplay", alsaArgs(a.playbackDevice, true)...)
+	newCapture.Stderr = alsaDiagnostics{callID: callID, stream: "capture"}
+	newPlayback.Stderr = alsaDiagnostics{callID: callID, stream: "playback"}
 	newRx, err := newCapture.StdoutPipe()
 	if err != nil {
 		a.releaseCall(callID)
@@ -152,22 +156,48 @@ func (a *ALSAAudio) Start(ctx context.Context, callID modem.CallID) error {
 	a.capture, a.playback, a.rx, a.tx = newCapture, newPlayback, newRx, newTx
 	primeStop := make(chan struct{})
 	a.primeStop = primeStop
+	a.playbackOwned = false
 	a.mu.Unlock()
 	// UAC full-duplex: when no client RTP is flowing, aplay sits in
 	// PREPARED and the gadget's ASYNC clock stalls, XRUN-ing the capture
 	// side (both are driven from the same isochronous feedback). Prime
-	// the playback stream with silence so README the interface stays
+	// the playback stream with silence so the interface stays
 	// RUNNING and capture keeps streaming.
 	go a.primeLoop(callID, primeStop)
-	slog.Info("alsa pair started", "call_id", callID, "capture", a.captureDevice, "playback", a.playbackDevice)
+	slog.Info("alsa pair started", "call_id", callID, "capture", a.captureDevice, "playback", a.playbackDevice,
+		"period_ms", FrameMillis, "buffer_ms", 80, "playback_start_ms", 40)
 	return nil
 }
 
-// primeLoop silently feeds the playback pipe when no real audio has
-// arrived for a while. It keeps the USB full-duplex clock moving so the
-// capture side never XRUNs.
+// Use 20ms transfers, an 80ms ring and a 40ms playback start threshold.
+// aplay's default start threshold is the full ring: the former 8192-sample
+// ring at 8kHz held back upstream speech by about a second even without jitter.
+func alsaArgs(device string, playback bool) []string {
+	args := []string{"-q", "-D", device, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(SampleRate), "-c", fmt.Sprint(Channels),
+		"--buffer-size=640", "--period-size=160"}
+	if playback {
+		args = append(args, "--start-delay=40000")
+	}
+	return args
+}
+
+type alsaDiagnostics struct {
+	callID modem.CallID
+	stream string
+}
+
+func (d alsaDiagnostics) Write(p []byte) (int, error) {
+	if message := strings.TrimSpace(string(p)); message != "" {
+		slog.Warn("alsa diagnostic", "call_id", d.callID, "stream", d.stream, "message", message)
+	}
+	return len(p), nil
+}
+
+// Prime only until the bridge takes over. The bridge already supplies silence
+// on underruns. Two independent 20ms writers can insert silence into speech,
+// fill the kernel pipe and accumulate seconds of upstream delay.
 func (a *ALSAAudio) primeLoop(callID modem.CallID, stop chan struct{}) {
-	silence := make([]int16, SampleRate/50) // 20ms of zeros
+	silence := make([]byte, FrameSamples*2)
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -175,27 +205,22 @@ func (a *ALSAAudio) primeLoop(callID modem.CallID, stop chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			a.mu.Lock()
-			active := a.call == callID
-			last := a.lastWrite
-			a.mu.Unlock()
-			if !active {
-				return
-			}
-			if time.Since(last) < 15*time.Millisecond {
-				continue // real audio is flowing; stand back
-			}
-			_, tx, _ := a.snapshot()
-			if tx == nil {
-				return
-			}
-			buffer := make([]byte, len(silence)*2)
-			for index, sample := range silence {
-				binary.LittleEndian.PutUint16(buffer[index*2:index*2+2], uint16(sample))
-			}
+			// Ownership must be checked under the write lock, otherwise an
+			// already-selected prime tick can insert silence after WritePCM.
 			a.txMu.Lock()
-			_, _ = tx.Write(buffer)
+			a.mu.Lock()
+			active := a.call == callID && a.primeStop == stop && !a.playbackOwned
+			tx := a.tx
+			a.mu.Unlock()
+			if !active || tx == nil {
+				a.txMu.Unlock()
+				return
+			}
+			_, err := tx.Write(silence)
 			a.txMu.Unlock()
+			if err != nil {
+				return
+			}
 		}
 	}
 }
@@ -222,20 +247,22 @@ func (a *ALSAAudio) ReadPCM(samples []int16) (int, error) {
 }
 
 func (a *ALSAAudio) WritePCM(samples []int16) (int, error) {
-	_, tx, callID := a.snapshot()
-	if callID == "" || tx == nil {
-		return 0, fmt.Errorf("ALSA audio is not active")
-	}
 	buffer := make([]byte, len(samples)*2)
 	for index, sample := range samples {
 		binary.LittleEndian.PutUint16(buffer[index*2:index*2+2], uint16(sample))
 	}
 	a.txMu.Lock()
-	count, err := tx.Write(buffer)
+	defer a.txMu.Unlock()
 	a.mu.Lock()
-	a.lastWrite = time.Now()
+	tx, callID := a.tx, a.call
+	if callID != "" && tx != nil {
+		a.playbackOwned = true
+	}
 	a.mu.Unlock()
-	a.txMu.Unlock()
+	if callID == "" || tx == nil {
+		return 0, fmt.Errorf("ALSA audio is not active")
+	}
+	count, err := tx.Write(buffer)
 	return count / 2, err
 }
 
@@ -253,8 +280,12 @@ func (a *ALSAAudio) Stop(ctx context.Context) error {
 	}
 	reap(capture)
 	reap(playback)
-	if rx != nil { _ = rx.Close() }
-	if tx != nil { _ = tx.Close() }
+	if rx != nil {
+		_ = rx.Close()
+	}
+	if tx != nil {
+		_ = tx.Close()
+	}
 	return nil
 }
 

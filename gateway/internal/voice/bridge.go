@@ -34,12 +34,17 @@ type Bridge struct {
 	clientPeakMax     int
 	cellularNonZero   uint64
 	clientNonZero     uint64
-	clientQueue       [][]int16
+	clientQueue       []clientPCMFrame
+	clientBuffering   bool
+	clientDropped     uint64
+	clientUnderruns   uint64
+	clientQueuePeak   int
 	cellularSum       uint64
 	clientSum         uint64
 	cellularWindowAt  time.Time
 	clientWindowAt    time.Time
 	mu                sync.Mutex
+	writeMu           sync.Mutex
 }
 
 func NewBridge(audio modem.VoiceAudio, media PCMUTransport) *Bridge {
@@ -65,6 +70,9 @@ func (b *Bridge) Start(ctx context.Context, callID modem.CallID) error {
 	b.clientFrameSeen = false
 	b.cellularFrameSeen = false
 	b.clientQueue = nil
+	b.clientBuffering = true
+	b.cellularWindowAt = time.Now()
+	b.clientWindowAt = b.cellularWindowAt
 	b.mu.Unlock()
 	b.media.OnPCMUFrame(func(frame []byte) {
 		if len(frame) != FrameSamples {
@@ -87,15 +95,21 @@ func (b *Bridge) Start(ctx context.Context, callID modem.CallID) error {
 		}
 		cpeak := pcmPeak(pcm)
 		b.clientFrames++
-		if cpeak > b.clientPeakMax { b.clientPeakMax = cpeak }
-		if cpeak > 0 { b.clientNonZero++ }
+		if cpeak > b.clientPeakMax {
+			b.clientPeakMax = cpeak
+		}
+		if cpeak > 0 {
+			b.clientNonZero++
+		}
 		b.clientSum += uint64(cpeak)
 		if b.clientFrames%50 == 0 {
 			now := time.Now()
 			elapsed := now.Sub(b.clientWindowAt)
 			b.clientWindowAt = now
-			slog.Info("voice client stats", "call_id", callID, "frames", b.clientFrames, "peak_max", b.clientPeakMax, "nonzero", b.clientNonZero, "mean", b.clientSum/uint64(b.clientFrames), "win_ms", elapsed.Milliseconds())
+			slog.Info("voice client stats", "call_id", callID, "frames", b.clientFrames, "peak_max", b.clientPeakMax, "nonzero", b.clientNonZero, "mean", b.clientSum/uint64(b.clientFrames), "win_ms", elapsed.Milliseconds(),
+				"queue_ms", len(b.clientQueue)*FrameMillis, "queue_peak_ms", b.clientQueuePeak*FrameMillis, "dropped", b.clientDropped, "underruns", b.clientUnderruns)
 			b.clientPeakMax = 0
+			b.clientQueuePeak = len(b.clientQueue)
 		}
 		clientHook := b.clientFrame
 		b.mu.Unlock()
@@ -114,25 +128,61 @@ func (b *Bridge) Start(ctx context.Context, callID modem.CallID) error {
 	return nil
 }
 
-// clientQueue holds decoded upstream frames between the RTP callback and
-// the fixed-rate playback ticker. Capacity is deliberate: keep at least
-// 3 frames so a 60ms network stall never starves aplay, and drop the
-// oldest frame when full so end-to-end latency cannot grow unbounded.
+// A short playout cushion absorbs packet bursts without allowing the old
+// one-second queue to become a persistent upstream delay. Recover to the
+// target depth on overflow; also expire frames if a device write stalls.
 const (
-	clientQueueSize = 50 // 1s @ 20ms — plenty of headroom for Wi-Fi jitter
+	clientQueueTarget = 3
+	clientQueueSize   = 6
+	clientMaxAge      = clientQueueSize * FrameMillis * time.Millisecond
 )
+
+type clientPCMFrame struct {
+	samples []int16
+	arrived time.Time
+}
 
 func (b *Bridge) enqueueClient(pcm []int16) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.clientQueue) >= clientQueueSize {
-		// drop oldest to bound latency
-		copy(b.clientQueue, b.clientQueue[1:])
-		b.clientQueue = b.clientQueue[:len(b.clientQueue)-1]
+	if !b.started {
+		return
 	}
-	frame := make([]int16, len(pcm))
-	copy(frame, pcm)
-	b.clientQueue = append(b.clientQueue, frame)
+	if len(b.clientQueue) >= clientQueueSize {
+		drop := len(b.clientQueue) - clientQueueTarget + 1
+		b.clientDropped += uint64(drop)
+		b.clientQueue = b.clientQueue[drop:]
+	}
+	b.clientQueue = append(b.clientQueue, clientPCMFrame{samples: append([]int16(nil), pcm...), arrived: time.Now()})
+	if len(b.clientQueue) > b.clientQueuePeak {
+		b.clientQueuePeak = len(b.clientQueue)
+	}
+}
+
+// nextClientFrame is called with b.mu held. A short initial cushion is also
+// rebuilt after starvation; stale speech is never replayed after a stall.
+func (b *Bridge) nextClientFrame(now time.Time) []int16 {
+	for len(b.clientQueue) > 0 && now.Sub(b.clientQueue[0].arrived) > clientMaxAge {
+		b.clientQueue[0] = clientPCMFrame{}
+		b.clientQueue = b.clientQueue[1:]
+		b.clientDropped++
+	}
+	if len(b.clientQueue) == 0 {
+		if !b.clientBuffering {
+			b.clientUnderruns++
+		}
+		b.clientBuffering = true
+		return nil
+	}
+	if b.clientBuffering && len(b.clientQueue) < clientQueueTarget &&
+		now.Sub(b.clientQueue[0].arrived) < (clientQueueTarget-1)*FrameMillis*time.Millisecond {
+		return nil
+	}
+	b.clientBuffering = false
+	frame := b.clientQueue[0].samples
+	b.clientQueue[0] = clientPCMFrame{}
+	b.clientQueue = b.clientQueue[1:]
+	return frame
 }
 
 // clientPlaybackLoop drains the jitter queue at a fixed 20ms cadence,
@@ -152,17 +202,16 @@ func (b *Bridge) clientPlaybackLoop(ctx context.Context, callID modem.CallID) {
 				b.mu.Unlock()
 				return
 			}
-			var frame []int16
-			if len(b.clientQueue) > 0 {
-				frame = b.clientQueue[0]
-				b.clientQueue = b.clientQueue[1:]
-			}
+			frame := b.nextClientFrame(time.Now())
 			b.mu.Unlock()
 			if frame == nil {
 				frame = silence
 			}
 			if err := b.writePCM(frame); err != nil {
-				slog.Warn("voice modem playback failed", "call_id", callID, "error", err)
+				if b.isStarted() {
+					slog.Warn("voice modem playback failed", "call_id", callID, "error", err)
+				}
+				return
 			}
 		}
 	}
@@ -202,8 +251,12 @@ func (b *Bridge) readLoop(ctx context.Context, callID modem.CallID) {
 		}
 		peak := pcmPeak(pcm)
 		b.cellularFrames++
-		if peak > b.cellularPeakMax { b.cellularPeakMax = peak }
-		if peak > 0 { b.cellularNonZero++ }
+		if peak > b.cellularPeakMax {
+			b.cellularPeakMax = peak
+		}
+		if peak > 0 {
+			b.cellularNonZero++
+		}
 		b.cellularSum += uint64(peak)
 		if b.cellularFrames%50 == 0 {
 			now := time.Now()
@@ -235,12 +288,14 @@ func (b *Bridge) isStarted() bool {
 }
 
 func (b *Bridge) writePCM(pcm []int16) error {
-	// Keep the started check and the write serialized with Stop. Otherwise the
-	// media callback can enter ALSA after Stop has closed the device and emit a
-	// misleading "audio is not active" error during normal call teardown.
+	// Device backpressure must not hold b.mu: RTP reception needs that lock,
+	// and Stop must be able to close the device to unblock a stalled write.
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if !b.started {
+	started := b.started
+	b.mu.Unlock()
+	if !started {
 		return nil
 	}
 	_, err := b.audio.WritePCM(pcm)
@@ -274,6 +329,9 @@ func (b *Bridge) Stop(ctx context.Context) error {
 		}
 		if started {
 			_ = b.audio.Stop(ctx)
+			// Drain the old writer before another call can reopen this device.
+			b.writeMu.Lock()
+			b.writeMu.Unlock()
 		}
 	})
 	return nil
