@@ -29,7 +29,7 @@ type Server struct {
 	admissionMu   sync.Mutex
 	inviteFinalMu sync.Mutex
 	inviteFinals  map[[32]byte]inviteFinal
-	pushToken     string
+	pushSender    func(context.Context, string, string, string) error
 	sendSMS       func(ctx context.Context, key, to, body string) (bool, error)
 	smsReceipts   sync.Map
 	callEvent     func(modem.ModemEvent)
@@ -42,11 +42,10 @@ func NewServer(listenAddr string, registrar *Registrar, auth *Auth, modemCtl *mo
 	return &Server{listenAddr: listenAddr, registrar: registrar, auth: auth, modem: modemCtl, audio: audio, ctx: ctx, cancel: cancel}
 }
 
-// AttachEvents wires modem events (RING etc) and the YakPhone push token
-// from config so inbound cellular calls can ring the SIP client (§21).
-func (s *Server) AttachEvents(events <-chan modem.ModemEvent, pushToken string) {
+// AttachEvents wires modem events and the shared, rotating push token provider.
+func (s *Server) AttachEvents(events <-chan modem.ModemEvent, send func(context.Context, string, string, string) error) {
 	s.events = events
-	s.pushToken = pushToken
+	s.pushSender = send
 }
 
 // AttachSMS wires the SMS engine so SIP MESSAGE requests from the phone
@@ -179,9 +178,8 @@ func (s *Server) endCallByModem(event modem.ModemEvent) {
 	}
 	slog.Info("sip call ended by modem", "call", sess.ID, "dir", sess.Direction, "state", sess.State(), "raw", event.Raw)
 	s.sendDialogTeardown(sess, "remote ended: "+event.Raw)
-	if err := sess.Hangup(); err == nil {
-		s.sessions.Delete(sess.ID)
-	}
+	sess.EndedByModem()
+	s.sessions.Delete(sess.ID)
 }
 
 // sessionForModemEvent maps a modem "ended" event back to the SIP dialog it
@@ -260,6 +258,7 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 	// for a CallKit call whose URI pointed at the phone itself. Prefer the
 	// interface used to reach the registered client.
 	reachable := ""
+	invitedRegistrations := make(map[string]time.Time)
 	// inviteRegistered invites every registration of this account that has not
 	// been invited yet, and reports how many invitations went out this pass.
 	//
@@ -274,7 +273,7 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 	inviteRegistered := func() int {
 		sent := 0
 		for _, reg := range s.registrar.All() {
-			remote := contactAddr(reg.Contact)
+			remote := reg.RemoteAddr()
 			if remote == nil {
 				continue
 			}
@@ -288,11 +287,14 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 			inviteSDP := fmt.Sprintf("v=0\r\no=cellbridge 0 0 IN IP4 %s\r\ns=CellBridge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n", local, local, media.LocalAddr().Port)
 			callerHdrs, callerFrom := inboundCallerHeaders(peer, local)
 			invite := fmt.Sprintf("INVITE sip:%s@%s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=%s;rport\r\nFrom: %s;tag=cb%s\r\nTo: <sip:%s@%s>\r\nCall-ID: %s\r\nCSeq: 1 INVITE\r\nContact: <sip:cellbridge@%s:5060>\r\nMax-Forwards: 70\r\n%sContent-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s", reg.Username, local, local, branch, callerFrom, shortID, reg.Username, local, callID, local, callerHdrs, len(inviteSDP), inviteSDP)
-			// Claim the address before sending it: a duplicate INVITE to the
-			// same contact rings the phone again instead of fixing anything.
-			if !sess.RememberInvite(inviteAttempt{addr: remote, req: invite}) {
+			// A push wake can recreate the SIP stack on the SAME UDP address.
+			// Reinvite a refreshed binding using the same transaction; remember
+			// only one teardown target per address.
+			firstInvite := sess.RememberInvite(inviteAttempt{addr: remote, req: invite})
+			if !firstInvite && !reg.LastSeen.After(invitedRegistrations[remote.String()]) {
 				continue
 			}
+			invitedRegistrations[remote.String()] = reg.LastSeen
 			// Remember where this invitation went, and the exact bytes of it.
 			// The far end can give up while the phone is still ringing, and the
 			// only way to stop that phone ringing is to CANCEL the invitation
@@ -300,17 +302,19 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 			// A later pickup overwrites this with the established dialog (see
 			// acceptInbound). With several registered clients the last one
 			// invited wins; V1 runs a single phone.
-			sess.SetByePlan(byePlan{
-				remote:       remote,
-				reqURI:       contactURI(reg.Contact, remote, reg.Username),
-				from:         fmt.Sprintf("%s;tag=cb%s", callerFrom, shortID),
-				to:           fmt.Sprintf("<sip:%s@%s>", reg.Username, local),
-				callID:       callID,
-				inviteCSeq:   1,
-				inviteBranch: branch,
-				inviteReq:    invite,
-				username:     reg.Username,
-			})
+			if firstInvite {
+				sess.SetByePlan(byePlan{
+					remote:       remote,
+					reqURI:       contactURI(reg.Contact, remote, reg.Username),
+					from:         fmt.Sprintf("%s;tag=cb%s", callerFrom, shortID),
+					to:           fmt.Sprintf("<sip:%s@%s>", reg.Username, local),
+					callID:       callID,
+					inviteCSeq:   1,
+					inviteBranch: branch,
+					inviteReq:    invite,
+					username:     reg.Username,
+				})
+			}
 			if _, err := s.conn.WriteToUDP([]byte(invite), remote); err != nil {
 				slog.Warn("sip inbound invite failed", "user", reg.Username, "err", err)
 				continue
@@ -333,7 +337,7 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 	if reachable == "" {
 		reachable = s.outboundIP()
 	}
-	s.sendYakPush("sip:"+peer+"@"+reachable, "voip", "")
+	go s.pushIfUnreachable(sess, "sip:"+peer+"@"+reachable, 1500*time.Millisecond)
 	slog.Info("sip inbound ringing", "call_id", callID, "peer", peer, "invites_sent", sent, "push_host", reachable)
 	go s.inviteReregisteredContacts(sess, inviteRegistered)
 	// Nobody picked up: release the cellular leg so the modem is not left
@@ -367,7 +371,7 @@ const inboundRingTimeout = 45 * time.Second
 // the invitation already on the wire was addressed to the port it has just
 // abandoned, so this sweep is what actually puts a ringing call in front of
 // the phone. It deliberately does not re-invite an address that was already
-// invited — only a moved contact is re-aimed at.
+// invited unless its registration was refreshed after the last invitation.
 const inboundInviteSweep = 600 * time.Millisecond
 
 // inviteReregisteredContacts keeps inviting contacts that turn up while the
@@ -426,6 +430,12 @@ func contactAddr(contact string) *net.UDPAddr {
 // "c=IN IP4 127.0.0.1" and sent its RTP to itself, so the uplink was silent
 // even though the downlink worked.
 func (s *Server) localIPFor(remote *net.UDPAddr) string {
+	// A specifically bound listener is the address the phone registered to.
+	if s.conn != nil {
+		if local, ok := s.conn.LocalAddr().(*net.UDPAddr); ok && local.IP != nil && !local.IP.IsUnspecified() {
+			return local.IP.String()
+		}
+	}
 	if remote != nil && !remote.IP.IsUnspecified() {
 		if conn, err := net.DialUDP("udp", nil, remote); err == nil {
 			defer conn.Close()
@@ -522,6 +532,14 @@ func (s *Server) handleResponse(msg string, remote *net.UDPAddr) {
 	}
 	switch {
 	case code == 100 || code == 180 || code == 183:
+		if (code == 180 || code == 183) && strings.HasSuffix(strings.ToUpper(cseq), " INVITE") {
+			for _, attempt := range sess.InviteAttempts() {
+				if attempt.addr.String() == remote.String() && parseHeader(attempt.req, "CSeq") == cseq {
+					sess.markRinging()
+					break
+				}
+			}
+		}
 		// Provisional: the client is ringing. Logged deliberately — a bare
 		// "phone did not ring" report is otherwise indistinguishable from
 		// three very different causes. 180/183 proves YakPhone received the
@@ -724,9 +742,9 @@ func (s *Server) handleRegister(msg string, remote *net.UDPAddr) {
 		s.sendResponse(remote, msg, 400, "Bad Request", "", "")
 		return
 	}
-	s.registrar.Register(username, contact, "UDP", expires)
+	s.registrar.RegisterFrom(username, contact, "UDP", expires, remote)
 	s.sendResponse(remote, msg, 200, "OK", "Contact: "+registrationContact(contact, expires)+"\r\nExpires: "+fmt.Sprintf("%d", expires)+"\r\n", "")
-	slog.Info("sip register", "user", username, "contact", contact, "expires", expires)
+	slog.Info("sip register", "user", username, "received", remote.String(), "expires", expires)
 }
 
 func registrationContact(contact string, expires int) string {
@@ -1022,6 +1040,11 @@ func (s *Server) nasIP() string {
 // is the only way to reach it — with a useless host in caller_uri the CallKit
 // call cannot be answered.
 func (s *Server) outboundIP() string {
+	if s.conn != nil {
+		if local, ok := s.conn.LocalAddr().(*net.UDPAddr); ok && local.IP != nil && !local.IP.IsUnspecified() {
+			return local.IP.String()
+		}
+	}
 	if ip := localTailnetIP(); ip != "" {
 		return ip
 	}
@@ -1162,7 +1185,7 @@ func (s *Server) sendDialogTeardown(sess *SIPCallSession, reason string) {
 			if plan.username != "" && reg.Username != plan.username {
 				continue
 			}
-			add(contactAddr(reg.Contact), "reregister")
+			add(reg.RemoteAddr(), "reregister")
 		}
 	}
 

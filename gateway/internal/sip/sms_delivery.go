@@ -38,7 +38,7 @@ func (s *Server) handleSMSResponse(callID string, code int, remote *net.UDPAddr)
 // the same transaction; a successful response means client acceptance, not
 // that a person has read it. Offline messages remain in the NAS database.
 func (s *Server) deliverSMS(ctx context.Context, reg *Registration, id, sender, body string) error {
-	remote := contactAddr(reg.Contact)
+	remote := reg.RemoteAddr()
 	if remote == nil {
 		return fmt.Errorf("invalid registered contact")
 	}

@@ -33,6 +33,9 @@ sip:
   realm: cellbridge
   users: []
   push_token: ""
+  # Optional dedicated callback behind private Tailscale HTTPS Serve.
+  # Enable with 127.0.0.1:8788; credentials persist in data/yakphone-push.json.
+  push_callback_listen: ""
 sms:
   # Initial diagnostics: upstream inbox polling imports then deletes modem SMS.
   # Enable only after the persistent database and SMS reception are ready.

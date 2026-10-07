@@ -11,10 +11,16 @@ import (
 type hangupPort struct {
 	scriptedPort
 	voiceRemains bool
+	releaseOnATH bool
 	polls        int
 }
 
 func (p *hangupPort) Write(data []byte) (int, error) {
+	if strings.TrimSpace(string(data)) == "ATH" && p.releaseOnATH {
+		p.mu.Lock()
+		p.voiceRemains = false
+		p.mu.Unlock()
+	}
 	if strings.TrimSpace(string(data)) != "AT+CLCC" {
 		return p.scriptedPort.Write(data)
 	}
@@ -74,5 +80,28 @@ func TestUncertainDialKeepsCallIDForCleanup(t *testing.T) {
 	id, err := a.Dial(ctx, "13800138000")
 	if id == "" || !errors.Is(err, context.DeadlineExceeded) || a.validateActive(id) != nil {
 		t.Fatalf("uncertain dial lost ownership: %q %v", id, err)
+	}
+}
+
+func TestHangupRetriesAcknowledgedButIgnoredCHUP(t *testing.T) {
+	p := &hangupPort{voiceRemains: true, releaseOnATH: true}
+	a := NewAdapter(NewClient(p))
+	defer a.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	id, err := a.Dial(ctx, "13800138000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-a.Events()
+	if err := a.Hangup(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	writes := strings.Join(p.writes, "")
+	if !strings.Contains(writes, "AT+CHUP") || !strings.Contains(writes, "ATH") || p.polls < 2 {
+		t.Fatalf("no verified fallback: %q", writes)
+	}
+	if event := <-a.Events(); event.Kind != "ended" {
+		t.Fatal("missing end")
 	}
 }

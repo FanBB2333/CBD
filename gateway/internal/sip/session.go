@@ -28,11 +28,12 @@ type SIPCallSession struct {
 	opMu          sync.Mutex
 	routePrepared bool // guarded by opMu; includes a partially prepared route
 	bridgeStarted bool // guarded by opMu
-	hangup        sync.Once
-	hangupErr     error
+	cleanup       sync.Once
 	answerSent    bool // guarded by mu
 	answerACK     chan struct{}
 	answerAcked   bool // guarded by mu
+	ringingSeen   bool // guarded by mu; a real SIP ringing response, not a push
+	ringing       chan struct{}
 	mu            sync.Mutex
 	state         string
 	onConnected   func(modem.CallID)
@@ -100,7 +101,18 @@ type byePlan struct {
 func NewSIPCallSession(id, peer, dir string, modemCtl *modem.ActiveCallAdapter, audio modem.VoiceAudio, media *MediaSession) *SIPCallSession {
 	ctx, cancel := context.WithCancel(context.Background())
 	br := voice.NewBridge(audio, media)
-	return &SIPCallSession{ID: id, Peer: peer, Direction: dir, modem: modemCtl, audio: audio, media: media, bridge: br, ctx: ctx, cancel: cancel, state: "init", answerACK: make(chan struct{})}
+	return &SIPCallSession{ID: id, Peer: peer, Direction: dir, modem: modemCtl, audio: audio, media: media, bridge: br, ctx: ctx, cancel: cancel, state: "init", answerACK: make(chan struct{}), ringing: make(chan struct{})}
+}
+
+func (s *SIPCallSession) markRinging() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ringingSeen {
+		s.ringingSeen = true
+		if s.ringing != nil {
+			close(s.ringing)
+		}
+	}
 }
 
 // Dial issues the cellular dial only. It returns as soon as the modem
@@ -290,24 +302,49 @@ func (s *SIPCallSession) AnswerInbound(ctx context.Context) error {
 // line so the next call never sees "active modem call exists".
 func (s *SIPCallSession) Hangup() error {
 	s.cancel()
-	s.hangup.Do(func() {
-		s.opMu.Lock()
-		defer s.opMu.Unlock()
-		if s.modem != nil && (s.Direction == "outbound" || s.Direction == "inbound") {
-			// Bounded hangup: ATH without a deadline can wedge the serial
-			// client's port lock forever, blocking every later dial.
-			hangupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			if err := s.modem.HangupCall(hangupCtx, s.ModemCallID()); err != nil && !errors.Is(err, modem.ErrNoActiveCall) {
-				s.hangupErr = err
-				slog.Error("sip cellular hangup failed", "call", s.ID, "modem_call", s.ModemCallID(), "error", err)
-			}
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if s.State() == "ended" {
+		return nil
+	}
+	var hangupErr error
+	if s.modem != nil && (s.Direction == "outbound" || s.Direction == "inbound") {
+		hangupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.modem.HangupCall(hangupCtx, s.ModemCallID()); err != nil && !errors.Is(err, modem.ErrNoActiveCall) {
+			hangupErr = err
+			slog.Error("sip cellular hangup failed", "call", s.ID, "modem_call", s.ModemCallID(), "error", err)
 		}
-		// Release the cellular leg before waiting for media process cleanup.
+	}
+	s.cleanupMedia()
+	s.mu.Lock()
+	if hangupErr == nil {
+		s.state = "ended"
+	} else {
+		s.state = "hangup_failed"
+	}
+	s.mu.Unlock()
+	return hangupErr
+}
+
+// EndedByModem handles the terminal event for this session's physical call.
+// A previous failed CHUP must not pin the session forever after NO CARRIER.
+// The modem already released the leg; do not send another global hangup.
+func (s *SIPCallSession) EndedByModem() {
+	s.cancel()
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	s.cleanupMedia()
+	s.mu.Lock()
+	s.state = "ended"
+	s.mu.Unlock()
+}
+
+// cleanupMedia is called with opMu held; retries never stop another call's
+// audio or close media twice.
+func (s *SIPCallSession) cleanupMedia() {
+	s.cleanup.Do(func() {
 		_ = s.bridge.Stop(context.Background())
-		// CANCEL can arrive after PrepareRoute but before Bridge.Start.
-		// Bridge.Stop only owns started audio; release this session's
-		// preparation explicitly so the next call cannot inherit it.
 		if s.routePrepared && !s.bridgeStarted && s.audio != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			if err := s.audio.Stop(cleanupCtx); err != nil {
@@ -319,15 +356,7 @@ func (s *SIPCallSession) Hangup() error {
 		if s.media != nil {
 			_ = s.media.Close()
 		}
-		s.mu.Lock()
-		if s.hangupErr == nil {
-			s.state = "ended"
-		} else {
-			s.state = "hangup_failed"
-		}
-		s.mu.Unlock()
 	})
-	return s.hangupErr
 }
 
 func (s *SIPCallSession) State() string { s.mu.Lock(); defer s.mu.Unlock(); return s.state }

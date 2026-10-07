@@ -169,7 +169,7 @@ func TestEndDuringCallerLookupDoesNotLeavePhantomRing(t *testing.T) {
 	s.conn = conn
 	defer s.cancel()
 	events := make(chan modem.ModemEvent, 2)
-	s.AttachEvents(events, "")
+	s.AttachEvents(events, nil)
 	done := make(chan struct{})
 	go func() { s.inboundLoop(); close(done) }()
 	events <- modem.ModemEvent{Kind: "incoming", CallID: "physical"}
@@ -182,12 +182,82 @@ func TestEndDuringCallerLookupDoesNotLeavePhantomRing(t *testing.T) {
 	close(ctl.releaseQuery)
 	close(events)
 	select {
-	case <-ctl.hungup:
+	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("end overtook caller lookup and left phantom ring")
 	}
-	<-done
 	if _, live := s.sessions.Load("in-physical"); live {
 		t.Fatal("ended invitation retained")
+	}
+}
+
+type failedHangupControl struct {
+	lifecycleControl
+	failure bool
+}
+
+func (c *failedHangupControl) Hangup(context.Context, modem.CallID) error {
+	c.hangups++
+	if c.failure {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+func TestTerminalEventReleasesFailedHangupSession(t *testing.T) {
+	ctl := &failedHangupControl{lifecycleControl: lifecycleControl{events: make(chan modem.ModemEvent)}, failure: true}
+	a := modem.NewActiveCallAdapter(ctl)
+	defer a.Close()
+	if err := a.Dial(context.Background(), "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	audio := &lifecycleAudio{}
+	sess := NewSIPCallSession("sip-call", "fixture", "outbound", a, audio, nil)
+	sess.SetModemCallID("physical")
+	sess.routePrepared = true
+	s := &Server{}
+	s.sessions.Store(sess.ID, sess)
+	if err := sess.Hangup(); err == nil || sess.State() != "hangup_failed" {
+		t.Fatal("failed hangup falsely completed")
+	}
+	s.endCallByModem(modem.ModemEvent{Kind: "ended", CallID: "unrelated"})
+	if _, ok := s.sessions.Load(sess.ID); !ok {
+		t.Fatal("unrelated terminal event released call")
+	}
+	s.endCallByModem(modem.ModemEvent{Kind: "ended", CallID: "physical"})
+	if _, ok := s.sessions.Load(sess.ID); ok || sess.State() != "ended" {
+		t.Fatal("terminal event retained failed session")
+	}
+	if err := sess.Hangup(); err != nil {
+		t.Fatal(err)
+	}
+	if ctl.hangups != 1 || audio.stops != 1 {
+		t.Fatalf("repeated cellular/audio teardown: %d/%d", ctl.hangups, audio.stops)
+	}
+	if !s.claimSession("next", &SIPCallSession{ID: "next"}) {
+		t.Fatal("next call still busy")
+	}
+}
+
+func TestFailedHangupCanRetryWithoutRepeatingAudioCleanup(t *testing.T) {
+	ctl := &failedHangupControl{lifecycleControl: lifecycleControl{events: make(chan modem.ModemEvent)}, failure: true}
+	a := modem.NewActiveCallAdapter(ctl)
+	defer a.Close()
+	if err := a.Dial(context.Background(), "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	audio := &lifecycleAudio{}
+	sess := NewSIPCallSession("sip-call", "fixture", "outbound", a, audio, nil)
+	sess.SetModemCallID("physical")
+	sess.routePrepared = true
+	if sess.Hangup() == nil {
+		t.Fatal("expected failure")
+	}
+	ctl.failure = false
+	if err := sess.Hangup(); err != nil || sess.State() != "ended" {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if ctl.hangups != 2 || audio.stops != 1 {
+		t.Fatalf("hangups=%d audio stops=%d", ctl.hangups, audio.stops)
 	}
 }

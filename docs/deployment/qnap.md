@@ -480,3 +480,100 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s gateway/tools -p 'test
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_fetch_voice_runtime.py'
 sh -n scripts/qnap-preflight.sh
 ```
+
+### YakPhone 注册地址、挂机重试与 Pro 推送（2026-10-03）
+
+本次故障日志显示，YakPhone 的 Contact 曾包含 `198.18.0.1`，实际 SIP 请求则从
+Tailscale 地址到达。网关现在保留原始 Contact，同时将鉴权后的 REGISTER 来源作为
+INVITE、MESSAGE 和后续挂断消息的 UDP 目的地；旧传输的注销不会删除新传输的绑定。
+来电期间，同地址重新注册也会收到相同事务的 INVITE，覆盖 PushKit 唤醒后重建 SIP 栈的情况。
+
+另一次呼出 CANCEL 已到达网关，但模块对 CHUP 返回成功后，CLCC 仍报告语音呼叫。
+现在仅在 CLCC 确认原通话仍存在时，依次有限重试 ATH、CHUP、ATH；始终查询 CLCC 验证，
+不把命令返回 OK 当成电话已断开。命令响应超时不盲目追加指令。
+真正的 NO CARRIER 会清理对应物理通话的失败会话，释放下一通电话的入口；不会误挂新通话。
+
+YakPhone Pro Token 上报接入：
+
+1. 在 `sip` 下配置 `push_callback_listen: 127.0.0.1:8788`，保持控制 API 仅监听回环地址。
+2. 首次启动生成 `data/yakphone-push.json`（权限 0600），保存独立随机 `callback_key` 和
+   最新 `voip_token`。原 `sip.push_token` 可用于首次迁移；已有持久 Token 优先。
+3. 通过私网 Tailscale Serve 将 HTTPS 端口转发到 `http://127.0.0.1:8788`。
+   QNAP 上已安装的 Tailscale 1.40 用法：
+   `tailscale serve https:8443 / http://127.0.0.1:8788`。不启用 Funnel。
+4. YakPhone 的 Token 回调 URL 填
+   `https://<NAS 的完整 ts.net 主机名>:8443/token/<callback_key>`，保存并发送当前 Token。
+   请求是 `POST application/json`，正文 `{"voip_token":"<设备 Token>"}`。
+   回调凭据只放在本机私有部署文件，不提交 Git；服务日志不输出 URL 密钥或 Token。
+5. 收到回调后立即原子保存并用于电话/短信推送，不需要重启。来电推送异步执行，
+   结束通话会取消尚未完成的 HTTP 请求，避免中继延迟阻塞挂机。
+
+推送使用现有 Yak 官方 `/v1/notify` 协议，检查 HTTP 和 JSON 错误；401/403 等不会再记成
+“已发送”。如果实际接口要求新的 HMAC 参数，必须以当前 App/官方接入说明为准，不能猜测密钥。
+HTTPS Token 上报成功仅表示服务器保存了 Token，仍需用真实来电验证 Pro 授权、锁屏唤醒、
+重新注册和接听；推送中继接受请求也不等于手机已经响铃。
+手机接听仍须能通过 Tailscale 连接 NAS。自动测试使用模拟 HTTP/AT/UDP，不拨号、不发送真实短信。
+
+本轮部署镜像为 `aae510ad2791`；回退镜像为 `cellbridge-gateway:pre-yak-fix-20261003`，
+配置备份为 NAS `config.before-yak-fix-20261003.yaml`。完整 Go 测试、SIP/AT/API/Yak 推送的
+竞态测试及 `go vet ./...` 均通过。2026-10-03 23:26（北京时间）重建后容器 healthy、重启次数 0。
+NAS 已启用仅 tailnet 可访问的 HTTPS 8443 → 回环 8788，证书验证通过；手机于 23:30 起自动
+上报 Token，回调返回 200，凭据文件权限 0600。官方 `type=missed` 测试及真实来电的
+`type=voip` 均返回 200；用 Python 默认 UA 的首个诊断请求被 Cloudflare 1010 拒绝，
+使用实际网关的 Go HTTP UA 成功，生产代码无需模仿浏览器或额外签名。
+
+23:29 来电已获手机 180，远端结束后两次 CANCEL 均获手机 200。
+23:31 呼出取消时触发 ATH 重试，约 1 秒内确认 `local_hangup`。
+用户确认呼入、呼出响铃时取消、接通后挂机均正常；锁屏后台唤醒另行验收，不与前台通话混同。
+
+随后锁屏接听测试暴露了重复提示：同一来电先得到 YakPhone 的 180，随后无条件发出的
+VoIP 推送又触发注册/系统来电，点击接听时 YakPhone 返回 486，模块按拒接挂断。
+第二次修复为先给 SIP 1.5 秒振铃窗口：当前 INVITE 的目标客户端已返回 180/183 时跳过
+冗余推送；只有未振铃且仍存活的来电才走 PushKit。100 Trying 不会抑制推送，无关来源的
+响应也不会抑制推送。全量测试、SIP 竞态检查及静态检查再次通过。
+
+去重版本镜像为 `286fc99b0391`，保留上一版 `cellbridge-gateway:pre-push-dedup-20261003`
+以便对照；最初的通话/音频稳定版本仍保留在 `pre-yak-fix-20261003`。
+第二次更新前确认无未结束通话、ALSA 双向 closed，更新后仅重建 CBD 容器。
+
+最终锁屏验收通过：23:38:21 收到来电时没有可达注册，23:38:24 官方接受 VoIP 推送，
+23:38:25 手机重新注册并返回 180，23:38:33.087 确认接通，23:39:16.796 以
+`local_hangup` 正常结束，接通时长 43709 ms。用户明确确认锁屏能接通、双方通话和挂机均正常。
+该次实际覆盖“推送唤醒 → 重新注册 → SIP 接听 → 模块接听 → 双向音频 → 挂断”，
+并非仅凭 HTTP 200 判断成功。验收后数据库完整性 ok、未结束通话为 0、ALSA 双向 closed，
+容器 healthy 且重启次数 0；QNAP 的 usb0 仍为 DOWN、RX/TX 均为 0。
+当前 Token 已通过手机 HTTPS 回调上报并持久化；不同 Token 的轮换由自动测试验证。私有日志保存在 NAS
+`data/after-yak-fix-20261003.log`。长时间休眠、多日 Token 轮换及 NAS 断电恢复尚未作为本轮验收项目。
+
+### 代理改写音频端口后的回程无声（2026-10-07）
+
+当天 11:30、11:31 的两次呼出均已接通。日志显示模块持续采集非零 PCM，手机的 RTP
+也到达网关；回程却固定使用 SIP 来源 IP 加 SDP 上报端口（分别为 22324、20116）。
+这不能单凭日志证明实际映射端口不同，但代码确实没有处理 UDP 代理/NAT 改写源端口。
+手机使用 Surge 内置 Tailscale 时，该缺口可导致信令、短信正常而回程音频丢失。
+
+修复在相同 SIP 对端 IP 内学习实际音频端口：连续 3 个 RTP v2、PCMU/PT=0、160 字节、
+相同 SSRC 且序号连续的包确认后，更新发送目标。端口映射再次变化时重新确认；非法包、
+其他地址、其他编码和单个杂散包不能改变回程目标。每个会话独立保存目标，新的 SDP
+设置会重置学习状态。保留原有声卡参数、队列延迟和每通重建模块音频路由的处理。
+相关背景见 [RFC 4961](https://www.rfc-editor.org/rfc/rfc4961.html)。
+
+隔离测试已在原版本复现“仍发送到 SDP 端口”的失败；新测试还覆盖实际 UDP 回传、
+来源限制、包格式/编码过滤、重复及跳号、端口重新映射和序号回绕。
+
+NAS 隔离容器中 `go test -race ./internal/sip`、`go test ./...` 和 `go vet ./...`
+均通过。测试容器需挂载仓库根目录（配置测试会读取 `infra/`），且使用 bridge 网络
+提供非回环网卡；仅挂载 gateway 或使用 network none 会分别导致现有配置/本机地址测试失败。
+
+2026-10-07 23:51（北京时间）部署镜像 `905f30531e65`，更新前确认没有通话、ALSA
+双向 closed；回退镜像为 `cellbridge-gateway:pre-rtp-return-20261007`。更新后健康接口
+返回 ok，容器 healthy 且重启次数为 0，数据库 quick_check 为 ok、无未结束通话，短信轮询已启动，usb0 保持 DOWN，
+RX/TX 均为 0。本次没有自动拨号或发送短信。
+
+23:52 用户发起的呼出已在现场确认端口改写：SIP 会话 `068e981049724f85` 的原回程
+目标为 `<手机 Tailscale 地址>:5532`，实际 RTP 来源为 `<手机 Tailscale 地址>:38616`；23:52:48
+网关成功学习新目标。双向均有非零音频帧，23:52:59 以 local_hangup 结束。
+这证实现场存在旧版无法处理的映射差异。用户随后明确反馈“两次都能正常双向通话”。
+服务器本轮可对应到上述一次新通话，不能将用户报告的两次均记为已逐通匹配日志。
+收尾检查确认未结束通话为 0、ALSA 双向 closed、数据库完整性 ok，容器 healthy 且
+重启次数 0；usb0 仍为 DOWN、RX/TX 均为 0。

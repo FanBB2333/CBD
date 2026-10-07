@@ -211,6 +211,11 @@ func (a *Adapter) Hangup(ctx context.Context, callID modem.CallID) error {
 	}
 	// ATH can return OK while configured to ignore voice hangup. Confirm
 	// the voice leg has disappeared before publishing a completed call.
+	// QDC507 can also acknowledge CHUP during call setup without releasing
+	// the leg. Retry only after CLCC positively confirms the same owned call
+	// remains, never after an uncertain command timeout.
+	retries := []string{"ATH", "AT+CHUP", "ATH"}
+	nextRetry := time.Now().Add(500 * time.Millisecond)
 	for {
 		if a.validateActive(callID) != nil {
 			return nil
@@ -222,6 +227,18 @@ func (a *Adapter) Hangup(ctx context.Context, callID modem.CallID) error {
 		if _, found := clccVoice(lines, modem.CLCCDirAny, 0, 1, 2, 3, 4, 5); !found {
 			a.finishActive(callID, "local_hangup")
 			return nil
+		}
+		if len(retries) > 0 && !time.Now().Before(nextRetry) {
+			if a.validateActive(callID) != nil {
+				return nil
+			}
+			command := retries[0]
+			retries = retries[1:]
+			slog.Warn("retry cellular hangup", "call", callID, "command", command)
+			if _, retryErr := a.client.Exchange(ctx, command); retryErr != nil && !errors.Is(retryErr, ErrCommandFailed) {
+				return fmt.Errorf("retry cellular hangup: %w", retryErr)
+			}
+			nextRetry = time.Now().Add(time.Second)
 		}
 		select {
 		case <-ctx.Done():

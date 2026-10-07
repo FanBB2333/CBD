@@ -70,11 +70,12 @@ type Config struct {
 		RedactLogs       bool `yaml:"redact_logs"`
 	} `yaml:"security"`
 	SIP struct {
-		Enabled   bool   `yaml:"enabled"`
-		Listen    string `yaml:"listen"`
-		Realm     string `yaml:"realm"`
-		PushToken string `yaml:"push_token"`
-		Users     []struct {
+		Enabled            bool   `yaml:"enabled"`
+		Listen             string `yaml:"listen"`
+		Realm              string `yaml:"realm"`
+		PushToken          string `yaml:"push_token"`
+		PushCallbackListen string `yaml:"push_callback_listen"`
+		Users              []struct {
 			Username string `yaml:"username"`
 			Password string `yaml:"password"`
 		} `yaml:"users"`
@@ -135,6 +136,9 @@ func Load(path string) (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if c.SIP.PushCallbackListen != "" && !isLoopbackAddress(c.SIP.PushCallbackListen) {
+		return fmt.Errorf("sip.push_callback_listen must bind loopback; expose it using private Tailscale Serve")
+	}
 	if c.Server.Listen == "" || c.Data.Dir == "" {
 		return fmt.Errorf("server.listen and data.dir are required")
 	}

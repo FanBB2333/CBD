@@ -31,6 +31,7 @@ import (
 	"github.com/cellbridge/cellbridge/gateway/internal/voice"
 	qdc507voice "github.com/cellbridge/cellbridge/gateway/internal/voice/qdc507"
 	"github.com/cellbridge/cellbridge/gateway/internal/webrtc"
+	"github.com/cellbridge/cellbridge/gateway/internal/yakpush"
 )
 
 func main() {
@@ -128,6 +129,26 @@ func main() {
 	}
 	shutdownContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	var yak *yakpush.Client
+	if settings.SIP.Enabled && (settings.SIP.PushToken != "" || settings.SIP.PushCallbackListen != "") {
+		var err error
+		yak, err = yakpush.Open(filepath.Join(settings.Data.Dir, "yakphone-push.json"), settings.SIP.PushToken)
+		if err != nil {
+			slog.Error("initialize YakPhone push", "error", err)
+			os.Exit(1)
+		}
+		application.YakPushSend = yak.Send
+		if settings.SIP.PushCallbackListen != "" {
+			callback := &http.Server{Addr: settings.SIP.PushCallbackListen, Handler: yak, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
+			defer callback.Close()
+			go func() {
+				if err := callback.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+					slog.Error("YakPhone callback listener failed", "error", err)
+				}
+			}()
+			slog.Info("YakPhone token callback listening", "addr", settings.SIP.PushCallbackListen)
+		}
+	}
 	if settings.Recording.Enabled {
 		recorder, recordingErr := recording.NewManager(database, filepath.Join(settings.Data.Dir, "recordings"), settings.Recording.RetentionDays)
 		if recordingErr != nil {
@@ -320,8 +341,7 @@ func main() {
 			}
 			sipServer := sip.NewServer(settings.SIP.Listen, registrar, sipAuth, callModem, application.VoiceAudio)
 			sipServer.AttachCallEvents(application.HandleModemEvent)
-			application.YakPushToken = settings.SIP.PushToken
-			sipServer.AttachEvents(sipEvents, settings.SIP.PushToken)
+			sipServer.AttachEvents(sipEvents, application.YakPushSend)
 			if application.SMSEngine != nil {
 				sipServer.AttachSMS(application.SMSEngine.SendOnce)
 			}

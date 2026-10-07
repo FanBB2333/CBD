@@ -1,43 +1,41 @@
 package sip
 
 import (
- "bytes"
- "context"
- "encoding/json"
- "log/slog"
- "net/http"
- "strings"
- "time"
+	"context"
+	"log/slog"
+	"time"
 )
 
-// sendYakPush fires the official YakPhone PushKit notification
-// (push.yakteam.com/v1/notify) so the phone wakes for an incoming SIP
-// call / missed call / SIP message even when YakPhone is suspended.
-func (s *Server) sendYakPush(callerURI, pushType, messageBody string) {
- if s.pushToken == "" {
-  slog.Warn("yakpush skipped", "reason", "no push token configured", "type", pushType)
-  return
- }
- body := map[string]string{
-  "token": s.pushToken,
-  "caller_uri": callerURI,
-  "caller_name": strings.TrimPrefix(callerURI, "sip:"),
-  "type": pushType,
- }
- if messageBody != "" { body["message_body"] = messageBody }
- payload, err := json.Marshal(body)
- if err != nil { return }
- req, err := http.NewRequest(http.MethodPost, "https://push.yakteam.com/v1/notify", bytes.NewReader(payload))
- if err != nil { return }
- req.Header.Set("Content-Type", "application/json")
- client := &http.Client{Timeout: 10 * time.Second}
- resp, err := client.Do(req)
- if err != nil {
-  slog.Warn("yakpush failed", "type", pushType, "err", err)
-  return
- }
- defer resp.Body.Close()
- slog.Info("yakpush sent", "type", pushType, "status", resp.Status)
+// A push while YakPhone already has a live ringing SIP call can create a
+// second system-call UI. Answering it rejects the original INVITE with 486.
+// Give the existing SIP flow a short chance to ring before waking the app.
+func (s *Server) pushIfUnreachable(sess *SIPCallSession, callerURI string, grace time.Duration) {
+	if s.pushSender == nil {
+		return
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-sess.ctx.Done():
+		return
+	case <-sess.ringing:
+		slog.Info("yakpush unnecessary", "call", sess.ID, "reason", "SIP client already ringing")
+		return
+	case <-timer.C:
+	}
+	sess.mu.Lock()
+	needed := !sess.ringingSeen && sess.state == "init" && sess.ctx.Err() == nil
+	sess.mu.Unlock()
+	if needed {
+		s.sendYakPush(sess.ctx, callerURI, "voip", "")
+	}
 }
 
-var _ = context.Background
+func (s *Server) sendYakPush(ctx context.Context, callerURI, pushType, messageBody string) {
+	if s.pushSender == nil {
+		return
+	}
+	if err := s.pushSender(ctx, callerURI, pushType, messageBody); err != nil && ctx.Err() == nil {
+		slog.Warn("yakpush failed", "type", pushType, "error", err)
+	}
+}

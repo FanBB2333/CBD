@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/hmac"
@@ -61,7 +60,7 @@ type Server struct {
 	VoiceAudio        modem.VoiceAudio
 	Recordings        *recording.Manager
 	PushSender        push.Sender
-	YakPushToken      string // official YakPhone push token (push.yakteam.com)
+	YakPushSend       func(context.Context, string, string, string) error
 	lineMu            sync.RWMutex
 	webrtcMu          sync.Mutex
 	webrtcCalls       map[string]*webrtc.Session
@@ -1726,37 +1725,12 @@ func (s *Server) sendIncomingCallPush(current call.Call) {
 // for an incoming SMS even when YakPhone is suspended. Voice calls use
 // the same endpoint through the SIP server.
 func (s *Server) sendYakPhonePush(pushType, callerURI, messageBody string) {
-	token := s.YakPushToken
-	if token == "" {
-		slog.Warn("yakpush skipped", "reason", "no push token configured", "type", pushType)
+	if s.YakPushSend == nil {
 		return
 	}
-	body := map[string]string{
-		"token":       token,
-		"caller_uri":  callerURI,
-		"caller_name": strings.TrimPrefix(callerURI, "sip:"),
-		"type":        pushType,
+	if err := s.YakPushSend(context.Background(), callerURI, pushType, messageBody); err != nil {
+		slog.Warn("yakpush failed", "type", pushType, "error", err)
 	}
-	if messageBody != "" {
-		body["message_body"] = messageBody
-	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return
-	}
-	req, err := http.NewRequest(http.MethodPost, "https://push.yakteam.com/v1/notify", bytes.NewReader(payload))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		slog.Warn("yakpush failed", "type", pushType, "err", err)
-		return
-	}
-	defer resp.Body.Close()
-	slog.Info("yakpush sent", "type", pushType, "status", resp.Status)
 }
 
 func (s *Server) sendMessagePush(message db.Message) {
@@ -1764,7 +1738,7 @@ func (s *Server) sendMessagePush(message db.Message) {
 	// the only channel the final architecture uses for SMS
 	// notifications (type=message). The legacy APNs Broker is kept as a
 	// fallback for non-YakPhone targets.
-	if s.YakPushToken != "" {
+	if s.YakPushSend != nil {
 		s.sendYakPhonePush("message", "sip:"+message.Peer, message.Body)
 	}
 	if s.Database == nil {

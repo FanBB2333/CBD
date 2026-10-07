@@ -116,3 +116,18 @@ func TestPrivateTURNRequiresExplicitHost(t *testing.T) {
 		t.Fatalf("private TURN configuration rejected: %v", err)
 	}
 }
+
+func TestYakCallbackRequiresLoopback(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:8788", "100.64.0.10:8788", "192.168.1.2:8788"} {
+		c := Default()
+		c.SIP.PushCallbackListen = address
+		if c.Validate() == nil {
+			t.Fatalf("accepted exposed callback %q", address)
+		}
+	}
+	c := Default()
+	c.SIP.PushCallbackListen = "127.0.0.1:8788"
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
