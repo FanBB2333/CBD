@@ -42,15 +42,10 @@ CELLBRIDGE_SMS_DRY_RUN=false；发送会真实提交运营商，按 SIM 套餐�
 IMS 字段语义参见 Quectel [QCFG 手册第 7.6 节](https://quectel.com/content/uploads/2024/02/Quectel_EC2xEG2xEG9xEM05_Series_QCFG_AT_Commands_Manual_V1.0.pdf)。
 QDC507 返回兼容格式；已据此修正 0,1 被误判为无语音控制能力的问题，没有修改模块 IMS 配置。
 
-```mermaid
-flowchart LR
-    Q[QDC507 + SIM] -->|USB AT bulk| P[容器内 Python/libusb → PTY]
-    P --> G[CellBridge Go 网关]
-    G -->|ADB：准备模块语音路由| Q
-    Q <-->|USB Audio：8000 Hz 单声道| A[QTS snd_usb_audio → 容器 ALSA]
-    A <--> G
-    G <-->|Tailscale 内 SIP/RTP| Y[iPhone YakPhone]
-```
+<p align="center">
+  <img src="../images/qnap-data-path.png" width="100%"
+       alt="QNAP 上的数据通路：QDC507 的 USB AT bulk 经容器内 Python/libusb 转成 PTY 交给 CellBridge Go 网关；网关通过 ADB 准备模块语音路由；USB Audio 8000 Hz 单声道经 QTS snd_usb_audio 进入容器 ALSA 再到网关；网关与 iPhone YakPhone 经 Tailscale 走 SIP/RTP">
+</p>
 
 ## 主机及模块实测
 

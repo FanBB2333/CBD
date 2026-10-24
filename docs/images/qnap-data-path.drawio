@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<mxfile host="drawio">
+  <diagram id="qnap-data-path" name="qnap-data-path">
+    <mxGraphModel grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" background="#FFFFFF" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="nasbox" value="QNAP NAS" style="rounded=1;whiteSpace=wrap;html=1;arcSize=4;dashed=1;fillColor=none;strokeColor=#82B366;strokeWidth=1.5;verticalAlign=top;align=left;spacingLeft=12;spacingTop=6;fontSize=13;fontColor=#4D7A3A;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="270" y="0" width="580" height="370" as="geometry"/>
+        </mxCell>
+        <mxCell id="module" value="&lt;b&gt;QDC507&lt;/b&gt;&lt;br&gt;+ SIM" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fontSize=15;fontColor=#1A1A1A;strokeWidth=1.5;fillColor=#FFF2CC;strokeColor=#D6B656;" vertex="1" parent="1">
+          <mxGeometry x="20" y="150" width="160" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="pty" value="&#x5BB9;&#x5668;&#x5185; Python/libusb&lt;br&gt;&#x2192; PTY" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fontSize=15;fontColor=#1A1A1A;strokeWidth=1.5;fillColor=#E1D5E7;strokeColor=#9673A6;" vertex="1" parent="1">
+          <mxGeometry x="300" y="40" width="230" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="alsa" value="QTS snd_usb_audio&lt;br&gt;&#x2192; &#x5BB9;&#x5668; ALSA" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fontSize=15;fontColor=#1A1A1A;strokeWidth=1.5;fillColor=#E1D5E7;strokeColor=#9673A6;" vertex="1" parent="1">
+          <mxGeometry x="300" y="270" width="230" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="gw" value="&lt;b&gt;CellBridge&lt;/b&gt;&lt;br&gt;Go &#x7F51;&#x5173;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fontSize=15;fontColor=#1A1A1A;strokeWidth=1.5;fillColor=#D5E8D4;strokeColor=#82B366;" vertex="1" parent="1">
+          <mxGeometry x="640" y="150" width="180" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="phone" value="&lt;b&gt;iPhone&lt;/b&gt;&lt;br&gt;YakPhone" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fontSize=15;fontColor=#1A1A1A;strokeWidth=1.5;fillColor=#DAE8FC;strokeColor=#6C8EBF;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="150" width="170" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="at" value="USB AT bulk" style="html=1;rounded=0;strokeColor=#555555;strokeWidth=1.5;fontSize=13;fontColor=#333333;labelBackgroundColor=#FFFFFF;endArrow=classic;endFill=1;edgeStyle=orthogonalEdgeStyle;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="module" target="pty">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="pty2gw" value="" style="html=1;rounded=0;strokeColor=#555555;strokeWidth=1.5;fontSize=13;fontColor=#333333;labelBackgroundColor=#FFFFFF;endArrow=classic;endFill=1;edgeStyle=orthogonalEdgeStyle;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="pty" target="gw">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="adb" value="ADB&#xFF1A;&#x51C6;&#x5907;&#x6A21;&#x5757;&#x8BED;&#x97F3;&#x8DEF;&#x7531;" style="html=1;rounded=0;strokeColor=#555555;strokeWidth=1.5;fontSize=13;fontColor=#333333;labelBackgroundColor=#FFFFFF;endArrow=classic;endFill=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="gw" target="module">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="uac" value="USB Audio&#xFF1A;8000 Hz &#x5355;&#x58F0;&#x9053;" style="html=1;rounded=0;strokeColor=#555555;strokeWidth=1.5;fontSize=13;fontColor=#333333;labelBackgroundColor=#FFFFFF;endArrow=classic;endFill=1;startArrow=classic;startFill=1;edgeStyle=orthogonalEdgeStyle;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="module" target="alsa">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="alsa2gw" value="" style="html=1;rounded=0;strokeColor=#555555;strokeWidth=1.5;fontSize=13;fontColor=#333333;labelBackgroundColor=#FFFFFF;endArrow=classic;endFill=1;startArrow=classic;startFill=1;edgeStyle=orthogonalEdgeStyle;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="alsa" target="gw">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="sip" value="SIP/RTP&lt;br&gt;&#x7ECF; Tailscale" style="html=1;rounded=0;strokeColor=#555555;strokeWidth=1.5;fontSize=13;fontColor=#333333;labelBackgroundColor=#FFFFFF;endArrow=classic;endFill=1;startArrow=classic;startFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="gw" target="phone">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
