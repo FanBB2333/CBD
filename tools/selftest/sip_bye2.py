@@ -1,18 +1,22 @@
-import socket, time
+#!/usr/bin/env python3
+"""
+Call, then hang up as soon as the gateway answers; checks that BYE gets 200.
 
-s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(2)
-time.sleep(0.5)
-bye=("BYE sip:10010@YOURNAS.ts.net SIP/2.0\r\n"
-  "Via: SIP/2.0/UDP 127.0.0.1:5090;branch=z9hG4bKselfbye2;rport\r\n"
-  "From: <sip:1001@YOURNAS.ts.net>;tag=selfinv2\r\n"
-  "To: <sip:10010@YOURNAS.ts.net>;\r\n"
-  "Call-ID: selfinv2@127.0.0.1\r\n"
-  "CSeq: 2 BYE\r\n"
-  "Content-Length: 0\r\n\r\n")
-s.sendto(bye.encode(), ("127.0.0.1", 5060))
-try:
-    data,_=s.recvfrom(8192)
-    print("BYE:", data.decode().split("\r\n")[0])
-except Exception as e:
-    print("TIMEOUT", e)
+Usage: SIP_PASS=yourpass python3 sip_bye2.py [dest]   (settings: see sipconf.py)
+Real call, use at your own cost.
+"""
+import sys
+
+from sipconf import PASSWORD, Client, first_line, status
+
+DEST = sys.argv[1] if len(sys.argv) > 1 else "10010"
+
+if __name__ == "__main__":
+    if not PASSWORD:
+        print("Set SIP_PASS env var"); sys.exit(2)
+    client = Client(5090)
+    response = client.invite(DEST)
+    if response is None or status(response) != 200:
+        print("CALL: FAIL (no 200)"); sys.exit(1)
+    response = client.bye()
+    print("BYE:", first_line(response) if response else "TIMEOUT")

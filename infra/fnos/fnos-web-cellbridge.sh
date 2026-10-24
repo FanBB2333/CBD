@@ -11,6 +11,8 @@ NS_IP="169.254.251.2"
 NGINX="/usr/trim/nginx/sbin/nginx"
 NAT_CHAIN="CB_FNOSWEB_NAT"
 FILTER_CHAIN="CB_FNOSWEB_FILTER"
+# Host addresses whose fnOS Web ports are forwarded; set in /etc/default/fnos-web-cellbridge.
+FNOS_WEB_ADDRESSES="${FNOS_WEB_ADDRESSES:?set FNOS_WEB_ADDRESSES in /etc/default/fnos-web-cellbridge}"
 child=""
 
 remove_jump() {
@@ -88,7 +90,7 @@ for interface in eth0 usb0; do
     fi
 done
 iptables -t nat -I OUTPUT 1 -j "$NAT_CHAIN"
-for address in 10.0.0.211 192.168.225.24; do
+for address in $FNOS_WEB_ADDRESSES; do
     for port in 80 443 5666 5667; do
         iptables -t nat -A "$NAT_CHAIN" -d "$address/32" -p tcp --dport "$port" \
             -j DNAT --to-destination "$NS_IP:$port"

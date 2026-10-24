@@ -41,15 +41,18 @@ fnOS 自带的 `trim` 包是系统核心，不能用 `apt remove` 卸载。为�
   Unix-socket 后端保持不变。
 - Host 只把物理网卡 `eth0`/`usb0` 上的 80、443、5666、5667 转发到该 namespace；
   `tailscale0:443` 仍只由 Tailscale Serve 提供 CellBridge。
-- 安装文件为 [`infra/fnos/fnos-web-cellbridge.sh`](../../infra/fnos/fnos-web-cellbridge.sh)
-  和 [`infra/fnos/fnos-web-cellbridge.service`](../../infra/fnos/fnos-web-cellbridge.service)。
+- 安装文件为 [`infra/fnos/fnos-web-cellbridge.sh`](../../infra/fnos/fnos-web-cellbridge.sh)、
+  [`infra/fnos/fnos-web-cellbridge.service`](../../infra/fnos/fnos-web-cellbridge.service)
+  和地址配置模板 [`infra/fnos/fnos-web-cellbridge.env.example`](../../infra/fnos/fnos-web-cellbridge.env.example)。
 
-在 fnOS NAS 上部署这两个文件后执行：
+在 fnOS NAS 上部署这三个文件后执行：
 
 ```sh
 systemctl mask --now trim_nginx.service
 install -m 0755 /path/to/fnos-web-cellbridge.sh /usr/local/sbin/fnos-web-cellbridge
 install -m 0644 /path/to/fnos-web-cellbridge.service /etc/systemd/system/fnos-web-cellbridge.service
+install -m 0644 /path/to/fnos-web-cellbridge.env.example /etc/default/fnos-web-cellbridge
+# 编辑 /etc/default/fnos-web-cellbridge，填入 NAS 的局域网地址和模块 ECM 侧的宿主地址
 systemctl daemon-reload
 systemctl enable --now fnos-web-cellbridge.service
 ```

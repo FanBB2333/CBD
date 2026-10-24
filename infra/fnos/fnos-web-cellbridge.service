@@ -6,6 +6,7 @@ Conflicts=trim_nginx.service
 
 [Service]
 Type=simple
+EnvironmentFile=/etc/default/fnos-web-cellbridge
 ExecStart=/usr/local/sbin/fnos-web-cellbridge
 KillMode=control-group
 Restart=on-failure
