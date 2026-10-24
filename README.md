@@ -134,7 +134,7 @@ git clone https://github.com/FanBB2333/CBD.git && cd CBD
      tx_path: hw:CARD=Baiwang,DEV=0
    sip:
      enabled: true
-     listen: 100.x.y.z:5060         # NAS 的 Tailscale 地址
+     listen: 100.64.0.10:5060       # 示例，换成 NAS 的 Tailscale 地址
      users:
        - username: iphone
          password: <随机密码>
@@ -157,7 +157,7 @@ git clone https://github.com/FanBB2333/CBD.git && cd CBD
 
 | 设置 | 值 |
 |---|---|
-| 服务器 | `<NAS 的 Tailscale 地址或 MagicDNS 名>:5060` |
+| 服务器 | `100.64.0.10:5060`（示例，换成 NAS 的 Tailscale 地址或 MagicDNS 名） |
 | 传输 | UDP |
 | 用户名 / 密码 | `sip.users` 中的配置 |
 | 编解码 | PCMU 优先 |
@@ -178,7 +178,7 @@ git clone https://github.com/FanBB2333/CBD.git && cd CBD
    ```
 
 3. 在 YakPhone 里把 Token 回调 URL 填为
-   `https://<NAS 的 ts.net 主机名>:8443/token/<callback_key>`。
+   `https://qnap-nas.example.ts.net:8443/token/<callback_key>`（主机名换成 NAS 的 ts.net 名称）。
 
 如果手机已经通过 SIP 振铃，网关就不再发推送，避免同一通来电响两次。
 

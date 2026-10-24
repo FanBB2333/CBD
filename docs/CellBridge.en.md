@@ -195,7 +195,7 @@ tailscale up --authkey=tskey-auth-XXXX --hostname cellbridge-nas
 
 # 4. Verify it's online and note the tailnet IP:
 tailscale status
-tailscale ip -4        # note it, e.g. 100.x.y.z (the config below uses the hostname instead)
+tailscale ip -4        # note it, e.g. 100.64.0.10 (the config below uses the hostname instead)
 ```
 
 ### 3.2 Install and log in on the iPhone

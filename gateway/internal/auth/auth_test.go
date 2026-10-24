@@ -96,7 +96,7 @@ func TestTailnetPairingAcceptsTailscalePeerButNotPublicAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := NewService("gw_test", database)
-	if _, err := service.StartPairingFromTailnet("100.105.36.112:443", "sha256/test"); err != nil {
+	if _, err := service.StartPairingFromTailnet("100.64.0.40:443", "sha256/test"); err != nil {
 		t.Fatalf("Tailscale IPv4 pairing = %v", err)
 	}
 	if _, err := service.StartPairingFromTailnet("[fd7a:115c:a1e0::152a:2471]:443", "sha256/test"); err != nil {

@@ -152,7 +152,7 @@ git clone https://github.com/FanBB2333/CBD.git && cd CBD
      tx_path: hw:CARD=Baiwang,DEV=0
    sip:
      enabled: true
-     listen: 100.x.y.z:5060         # the NAS's Tailscale address
+     listen: 100.64.0.10:5060       # example: use the NAS's Tailscale address
      users:
        - username: iphone
          password: <random password>
@@ -177,7 +177,7 @@ git clone https://github.com/FanBB2333/CBD.git && cd CBD
 
 | Setting | Value |
 |---|---|
-| Server | `<NAS Tailscale address or MagicDNS name>:5060` |
+| Server | `100.64.0.10:5060` (example: use the NAS's Tailscale address or MagicDNS name) |
 | Transport | UDP |
 | Username / password | From `sip.users` |
 | Codec | PCMU first |
@@ -201,7 +201,7 @@ This needs YakPhone Pro.
    ```
 
 3. In YakPhone, set the token callback URL to
-   `https://<NAS ts.net hostname>:8443/token/<callback_key>`.
+   `https://qnap-nas.example.ts.net:8443/token/<callback_key>`, with the NAS's own ts.net hostname.
 
 If the phone is already ringing through SIP, the gateway skips the push so the
 same call doesn't ring twice.

@@ -239,21 +239,21 @@ func TestCSeqNumber(t *testing.T) {
 // sip:<user>@<gateway>. RFC 3261 §9.1 requires the two to match, so the phone
 // could not tie the CANCEL to the invitation on its screen and kept ringing.
 func TestCancelMessageMirrorsTheInvite(t *testing.T) {
-	invite := "INVITE sip:iphone@192.168.31.109 SIP/2.0\r\n" +
-		"Via: SIP/2.0/UDP 192.168.31.109:5060;branch=z9hG4bK9c1f0d2a;rport\r\n" +
-		"From: \"13800138000\" <sip:13800138000@192.168.31.109>;tag=cb9c1f0d2a\r\n" +
-		"To: <sip:iphone@192.168.31.109>\r\n" +
+	invite := "INVITE sip:iphone@192.168.1.30 SIP/2.0\r\n" +
+		"Via: SIP/2.0/UDP 192.168.1.30:5060;branch=z9hG4bK9c1f0d2a;rport\r\n" +
+		"From: \"13800138000\" <sip:13800138000@192.168.1.30>;tag=cb9c1f0d2a\r\n" +
+		"To: <sip:iphone@192.168.1.30>\r\n" +
 		"Call-ID: in-9c1f0d2a\r\n" +
 		"CSeq: 1 INVITE\r\n" +
-		"Contact: <sip:cellbridge@192.168.31.109:5060>\r\n" +
+		"Contact: <sip:cellbridge@192.168.1.30:5060>\r\n" +
 		"Content-Length: 0\r\n\r\n"
 
-	msg := cancelMessage(invite, "192.168.31.109")
+	msg := cancelMessage(invite, "192.168.1.30")
 	for _, want := range []string{
-		"CANCEL sip:iphone@192.168.31.109 SIP/2.0",
+		"CANCEL sip:iphone@192.168.1.30 SIP/2.0",
 		"branch=z9hG4bK9c1f0d2a",
-		`From: "13800138000" <sip:13800138000@192.168.31.109>;tag=cb9c1f0d2a`,
-		"To: <sip:iphone@192.168.31.109>",
+		`From: "13800138000" <sip:13800138000@192.168.1.30>;tag=cb9c1f0d2a`,
+		"To: <sip:iphone@192.168.1.30>",
 		"Call-ID: in-9c1f0d2a",
 		"CSeq: 1 CANCEL",
 	} {
@@ -420,16 +420,16 @@ func TestReregisteredContactIsInvitedAgain(t *testing.T) {
 // The caller number has to survive the trip into the INVITE: iOS fills the
 // lock-screen caller from the From display name, and a bare URI showed nothing.
 func TestInboundCallerHeadersCarryTheNumber(t *testing.T) {
-	extra, from := inboundCallerHeaders("13800138000", "192.168.31.109")
+	extra, from := inboundCallerHeaders("13800138000", "192.168.1.30")
 	if !strings.Contains(from, `"13800138000"`) {
 		t.Errorf("From 缺少带引号的号码显示名: %q", from)
 	}
-	if !strings.Contains(from, "<sip:13800138000@192.168.31.109>") {
+	if !strings.Contains(from, "<sip:13800138000@192.168.1.30>") {
 		t.Errorf("From 缺少号码 URI: %q", from)
 	}
 	for _, want := range []string{
-		`P-Asserted-Identity: "13800138000" <sip:13800138000@192.168.31.109>`,
-		`Remote-Party-ID: "13800138000" <sip:13800138000@192.168.31.109>`,
+		`P-Asserted-Identity: "13800138000" <sip:13800138000@192.168.1.30>`,
+		`Remote-Party-ID: "13800138000" <sip:13800138000@192.168.1.30>`,
 	} {
 		if !strings.Contains(extra, want) {
 			t.Errorf("缺少 %q\n--- got ---\n%s", want, extra)
@@ -440,11 +440,11 @@ func TestInboundCallerHeadersCarryTheNumber(t *testing.T) {
 // A call with no caller id must still produce a well-formed From: an empty
 // header is rejected by some clients, which would drop the call entirely.
 func TestInboundCallerHeadersWithoutNumberStayWellFormed(t *testing.T) {
-	extra, from := inboundCallerHeaders("", "192.168.31.109")
+	extra, from := inboundCallerHeaders("", "192.168.1.30")
 	if extra != "" {
 		t.Errorf("无号码时不应产生身份头，得到 %q", extra)
 	}
-	if !strings.HasPrefix(from, "<sip:unknown@192.168.31.109>") {
+	if !strings.HasPrefix(from, "<sip:unknown@192.168.1.30>") {
 		t.Errorf("无号码时 From 应为 unknown URI，得到 %q", from)
 	}
 }

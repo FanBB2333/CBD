@@ -4,6 +4,7 @@
 上游基线见 [`UPSTREAM_COMMIT`](../../UPSTREAM_COMMIT)，参考 dontmove-kit
 `666d22a45f3b8df29945132520aaafd922d395a7`。本文已结合用户提供的
 QNAP + QDC507 + CellBridge + YakPhone 部署与开发指南，以当前源码及实测为准。
+文中的 IP 地址和 Tailscale 主机名均为示例值，不是实际部署使用的地址。
 
 **正式 Docker 网关已运行且 healthy；USB AT、ADB、UAC 空闲音频及 SIP 鉴权注册已通过。**
 当前无需购买额外声卡，QDC507 自身的 USB Audio 已在 QTS 上识别并完成采集测试；
@@ -20,7 +21,7 @@ QNAP + QDC507 + CellBridge + YakPhone 部署与开发指南，以当前源码及
 保留现有通话所需的蜂窝注册与 IMS 配置；不为禁止上网而盲目关闭模块射频或更改 IMS。
 模块重新枚举或 NAS 重启后，重新检查默认路由和模块数据接口，再执行需要互联网的操作。
 
-本次只读复核：默认出口为 qvs1 → 家庭网关，模块 usb0 为 DOWN，RX/TX 均为 0。
+本次只读复核：默认出口为 qvs1 → 192.168.1.1，模块 usb0 为 DOWN，RX/TX 均为 0。
 随后用户明确授权开启短信收发，正式配置已改为 sms.inbox_enabled=true、
 CELLBRIDGE_SMS_DRY_RUN=false；发送会真实提交运营商，按 SIM 套餐计费。
 用户选择自行在手机测试，代理未代发短信。手机收发结果见下文短信验收记录。
@@ -59,7 +60,7 @@ flowchart LR
 | QTS / 内核 | 5.2.9.3499 / 5.10.60-qnap |
 | Container Station | 3.0.7.891 |
 | Docker / Compose | 20.10.27-qnap1 / 2.15.1-qnap1，overlay2 |
-| Tailscale | 已加入 tailnet，SIP 与 RTP 绑定 NAS 的 Tailscale 地址 |
+| Tailscale | 100.64.0.10；qnap-nas.example.ts.net |
 | SSH | 用户已开启，普通用户公钥登录成功，可操作 Docker |
 | USB | 物理端口 1-2，480 Mb/s，2ca3:4006，BAIWANG/Baiwang |
 | AT 模型 / 固件 | QDC507 / QDC507GLEFM21 |
@@ -114,7 +115,7 @@ AT 接口为 interface 2，bulk OUT 0x03、IN 0x84，未绑定内核驱动。
 
 本次经用户明确授权，解锁 ADB、开启 UAC 并重启模块一次，没有刷写固件、修改 VID/PID 或安装 QTS 内核驱动。
 代理没有主动拨号或发送/存储短信，也没有重启 NAS；用户自行进行了上述真实来电测试。
-NAS 默认出口为 qvs1 → 家庭网关，
+NAS 默认出口为 qvs1 → 192.168.1.1，
 模块 usb0 保持 DOWN，最终检查 RX/TX 均为 0；镜像和软件包下载使用家庭网络。
 这些主机侧计数不能替代运营商账单，但确认本次没有使用模块作为上网出口。
 
@@ -221,7 +222,7 @@ Debian 源配置参考 [TUNA 官方说明](https://mirrors.tuna.tsinghua.edu.cn/
 
 1. modem.usb_path 填实际端口 1-2。
 2. voice.rx_path/tx_path 填实测的 hw:CARD=Baiwang,DEV=0，不能直接套 hw:0,0。
-3. network.tailnet_hostname 填本机 MagicDNS，sip.listen 填 `<NAS 的 Tailscale 地址>:5060`。
+3. network.tailnet_hostname 填本机 MagicDNS，sip.listen 填 100.64.0.10:5060。
    HTTP 保持 127.0.0.1:8787，不添加公网端口转发。
 4. 设备和 runtime 检查通过后，将 voice.enabled、voice.bootstrap、sip.enabled 改为 true，
    配置一个独立 SIP 用户和随机密码。NAS 配置采用组 0、权限 640，Mac 私有副本 600；不提交凭据和数据库。
@@ -261,7 +262,7 @@ cs_path=$(getcfg container-station Install_Path -f /etc/config/qpkg.conf)
 /sbin/curl -fsS http://127.0.0.1:8787/api/v1/health
 ```
 
-SIP 为 `<NAS 的 Tailscale 地址>:5060/UDP`，用户名 `iphone`；密码仅保存在私有配置。
+SIP 为 `100.64.0.10:5060/UDP`，用户名 `iphone`；密码仅保存在私有配置。
 Mac 的 `artifacts/qnap/deployment/yakphone-connection.txt` 包含手机完整接入参数，已被 Git 忽略。
 ADB 仅监听回环 `127.0.0.1:5038`，HTTP 仅监听回环 `127.0.0.1:8787`。
 
@@ -399,7 +400,7 @@ QNAP 真机硬件测试（北京时间 19:10）通过：准备路由后不启动
 19:43 部署后健康接口正常。Mac 经 Tailscale 对运行中的网关做了仅查询 REGISTER 的验证：
 独立挑战、交错重传、计数乱序、计数重置后的新挑战、过期 nonce 自动刷新均通过，错误密码仍返回 401。
 验证不携带 Contact，不修改手机注册，也没有拨打真实电话或发送短信。
-NAS 默认路由仍为家庭网关，模块 `usb0` 为 DOWN，收发计数均为 0。
+NAS 默认路由仍为家庭网关 `192.168.1.1`，模块 `usb0` 为 DOWN，收发计数均为 0。
 此时手机尚未重新注册；已请用户打开 YakPhone 后复测两次真实拨号、双向声音及挂断。
 
 ### 上行语音延迟与静音插帧
@@ -502,7 +503,7 @@ YakPhone Pro Token 上报接入：
    QNAP 上已安装的 Tailscale 1.40 用法：
    `tailscale serve https:8443 / http://127.0.0.1:8788`。不启用 Funnel。
 4. YakPhone 的 Token 回调 URL 填
-   `https://<NAS 的完整 ts.net 主机名>:8443/token/<callback_key>`，保存并发送当前 Token。
+   `https://qnap-nas.example.ts.net:8443/token/<callback_key>`，保存并发送当前 Token。
    请求是 `POST application/json`，正文 `{"voip_token":"<设备 Token>"}`。
    回调凭据只放在本机私有部署文件，不提交 Git；服务日志不输出 URL 密钥或 Token。
 5. 收到回调后立即原子保存并用于电话/短信推送，不需要重启。来电推送异步执行，
@@ -571,7 +572,7 @@ NAS 隔离容器中 `go test -race ./internal/sip`、`go test ./...` 和 `go vet
 RX/TX 均为 0。本次没有自动拨号或发送短信。
 
 23:52 用户发起的呼出已在现场确认端口改写：SIP 会话 `068e981049724f85` 的原回程
-目标为 `<手机 Tailscale 地址>:5532`，实际 RTP 来源为 `<手机 Tailscale 地址>:38616`；23:52:48
+目标为 `100.64.0.21:5532`，实际 RTP 来源为 `100.64.0.21:38616`；23:52:48
 网关成功学习新目标。双向均有非零音频帧，23:52:59 以 local_hangup 结束。
 这证实现场存在旧版无法处理的映射差异。用户随后明确反馈“两次都能正常双向通话”。
 服务器本轮可对应到上述一次新通话，不能将用户报告的两次均记为已逐通匹配日志。

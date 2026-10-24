@@ -437,7 +437,7 @@ func TestTailnetPairingStartAcceptsTailscalePeerOnly(t *testing.T) {
 	handler := application.Handler()
 
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/pairing/start", nil)
-	request.RemoteAddr = "100.105.36.112:443"
+	request.RemoteAddr = "100.64.0.40:443"
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {

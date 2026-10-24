@@ -187,7 +187,7 @@ tailscale up --authkey=tskey-auth-XXXX --hostname cellbridge-nas
 
 # 4. 验证已上线并记录 tailnet IP:
 tailscale status
-tailscale ip -4        # 记录，例：100.x.y.z（下文配置用域名代替）
+tailscale ip -4        # 记录，例：100.64.0.10（下文配置用域名代替）
 ```
 
 ### 3.2 iPhone 安装并登录
