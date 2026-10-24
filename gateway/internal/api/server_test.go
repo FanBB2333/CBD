@@ -18,8 +18,31 @@ import (
 	"github.com/cellbridge/cellbridge/gateway/internal/auth"
 	"github.com/cellbridge/cellbridge/gateway/internal/call"
 	"github.com/cellbridge/cellbridge/gateway/internal/db"
+	"github.com/cellbridge/cellbridge/gateway/internal/eventbus"
 	"github.com/cellbridge/cellbridge/gateway/internal/recording"
 )
+
+func TestInboundSMSPublishesFullMessageWithoutGenericYakPush(t *testing.T) {
+	server := NewServer("fixture", "fixture", "test")
+	server.Events = eventbus.New()
+	events, cancel := server.Events.Subscribe()
+	defer cancel()
+	server.YakPushSend = func(context.Context, string, string, string) error {
+		t.Fatal("SMS triggered a generic YakPhone push in addition to SIP delivery")
+		return nil
+	}
+	message := &db.Message{ID: "msg-fixture", Direction: "inbound", Peer: "10086", Body: "中文内容预览", SyncSeq: 42}
+	server.HandleMessage(message)
+	select {
+	case event := <-events:
+		payload, ok := event.Data.(messageResponse)
+		if !ok || event.Type != "message.created" || event.Seq != 42 || payload.ID != message.ID || payload.Body != message.Body {
+			t.Fatalf("message event lost content: %+v", event)
+		}
+	default:
+		t.Fatal("SMS sync event was lost")
+	}
+}
 
 func TestReadOnlyV1Endpoints(t *testing.T) {
 	server := NewServer("gw_test", "Test Gateway", "dev")

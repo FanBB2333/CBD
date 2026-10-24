@@ -138,6 +138,7 @@ func main() {
 			os.Exit(1)
 		}
 		application.YakPushSend = yak.Send
+		slog.Info("YakPhone SMS notification route", "transport", "sip-message", "generic_push", false)
 		if settings.SIP.PushCallbackListen != "" {
 			callback := &http.Server{Addr: settings.SIP.PushCallbackListen, Handler: yak, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 			defer callback.Close()

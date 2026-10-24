@@ -1,6 +1,6 @@
 # CBD：QNAP 部署方案与实测记录
 
-更新：2026-10-01。CBD 是 CellBridge-Docker，保留 CellBridge 上游历史。
+更新：2026-10-19。CBD 是 CellBridge-Docker，保留 CellBridge 上游历史。
 上游基线见 [`UPSTREAM_COMMIT`](../../UPSTREAM_COMMIT)，参考 dontmove-kit
 `666d22a45f3b8df29945132520aaafd922d395a7`。本文已结合用户提供的
 QNAP + QDC507 + CellBridge + YakPhone 部署与开发指南，以当前源码及实测为准。
@@ -72,8 +72,8 @@ flowchart LR
 | QTS 声音驱动 | snd_usb_audio 已识别 Baiwang USB Audio；当前 card 1，配置使用稳定卡名 |
 | UAC 格式 | capture / playback 均为 S16_LE、单声道、8000 Hz |
 | 宿主串口 | 无 ttyUSB/ttyACM；检查范围内无 option/usb_wwan/qcserial 模块 |
-| 数据卷 | CACHEDEV6（HC510）约余 2.7 TiB，可以存放应用数据 |
-| Docker 存储卷 | 构建并清理本次旧镜像后 CACHEDEV1 约余 6.0 GiB、已用 94%；数据放 HC510 不会迁移镜像存储 |
+| 应用数据卷 | CBD 配置、数据库和语音组件放在 HDD 数据卷，不占系统 SSD |
+| Docker 存储卷 | Docker 数据目录位于 HDD 数据卷 |
 
 AT 接口为 interface 2，bulk OUT 0x03、IN 0x84，未绑定内核驱动。
 其他接口不被抢占；ECM 的 cdc_ether 绑定保持原状。
@@ -577,3 +577,29 @@ RX/TX 均为 0。本次没有自动拨号或发送短信。
 服务器本轮可对应到上述一次新通话，不能将用户报告的两次均记为已逐通匹配日志。
 收尾检查确认未结束通话为 0、ALSA 双向 closed、数据库完整性 ok，容器 healthy 且
 重启次数 0；usb0 仍为 DOWN、RX/TX 均为 0。
+
+### 短信只保留正文预览通知（2026-10-19）
+
+用户确认重复提醒的外观不同：第一次是 YakPhone 的“有短信＋号码”，第二次才带正文预览，
+并明确选择只保留第二种。网关原先在短信入库后立即调用 Yak 中继 `type=message`，
+另一个独立流程再用 SIP MESSAGE 投递正文；两条路径先后触发手机通知。
+
+本次移除 API 收信回调中的 Yak 短信推送，只通过现有 SIP MESSAGE 传递短信正文。
+来电 PushKit、Token 回调、短信入库及 SIP 接收回执保留；不把推送中继的 HTTP 200
+记作手机已接收正文。手机离线或休眠且 SIP 不可达时，短信保存在 NAS，等 YakPhone
+恢复连接后补收，因此此模式不提供独立的离线短信推送唤醒。
+
+Go 全量测试、API/SIP/SMS/DB/Yak 推送竞态检查及 `go vet ./...` 通过；新增回归测试
+验证收信不会触发额外 Yak 推送，同时仍发布完整中文短信同步事件。既有 SIP 测试覆盖
+完整 UTF-8 正文、同事务重传及手机接收确认。未发送测试运营商短信。
+
+修复于北京时间 12:56 部署，镜像 `f62f610467ac`，回退镜像
+`cellbridge-gateway:pre-sms-preview-20261019T045254Z`。数据库快照为 NAS
+`cbd/data/backups/before-sms-preview-20261019T045254Z.sqlite`；部署文件、原配置及日志
+保存在 `cbd/deployments/sms-preview-20261019T045254Z/`，其中私有文件不提交 Git。
+新镜像复用原运行环境，只替换通过 SHA-256 核对的网关二进制。
+
+部署后容器 healthy、重启次数 0，数据库 quick_check 为 ok，67 条接收短信及 67 条
+SIP 接收回执完整，配置未改动。只读 SIP 验证为无凭据 401、错误密码 401、正确绑定
+查询 200，手机已注册且查询没有替换绑定。启动日志明确记录
+`transport=sip-message generic_push=false`。手机通知外观尚待用户下一次实际收信确认。

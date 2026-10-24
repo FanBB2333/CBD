@@ -1720,27 +1720,11 @@ func (s *Server) sendIncomingCallPush(current call.Call) {
 	}
 }
 
-// sendYakPhonePush fires the official YakPhone PushKit notification
-// (push.yakteam.com/v1/notify) from the API server so the phone wakes
-// for an incoming SMS even when YakPhone is suspended. Voice calls use
-// the same endpoint through the SIP server.
-func (s *Server) sendYakPhonePush(pushType, callerURI, messageBody string) {
-	if s.YakPushSend == nil {
-		return
-	}
-	if err := s.YakPushSend(context.Background(), callerURI, pushType, messageBody); err != nil {
-		slog.Warn("yakpush failed", "type", pushType, "error", err)
-	}
-}
-
 func (s *Server) sendMessagePush(message db.Message) {
-	// YakPhone official push (push.yakteam.com) takes precedence: it is
-	// the only channel the final architecture uses for SMS
-	// notifications (type=message). The legacy APNs Broker is kept as a
-	// fallback for non-YakPhone targets.
-	if s.YakPushSend != nil {
-		s.sendYakPhonePush("message", "sip:"+message.Peer, message.Body)
-	}
+	// YakPhone receives the full SMS through SIP MESSAGE, including offline
+	// catch-up. Its separate type=message push only adds a generic alert and
+	// would notify a second time. Keep YakPushSend for SIP call wake-ups;
+	// this broker path serves separately registered native API clients.
 	if s.Database == nil {
 		slog.Warn("push skipped", "kind", "message", "reason", "database unavailable", "error_code", "BLOCKED_EXTERNAL_APNS", "message_id", message.ID)
 		return
