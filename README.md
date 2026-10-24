@@ -1,742 +1,272 @@
 <div align="center">
 
-# CellBridge
+# CBD
 
-**让任意 QDC507 4G 模块 + SIM 卡，成为你 iPhone 的私人蜂窝网关。**
-**Turn any QDC507 4G module + SIM card into a personal cellular gateway for your iPhone.**
+**把 QDC507 4G 模块和一张 SIM 卡，变成 NAS 上 7×24 在线的 iPhone 副号网关：
+VoLTE 通话、短信收发、锁屏来电。**
 
-[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go)](https://go.dev)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://img.shields.io/badge/CI-GitHub%20Actions-blue)](.github/workflows/build.yml)
+[![Go][go-shield]][go-url]
+[![Docker][docker-shield]][docker-url]
+[![License][license-shield]][license-url]
 
-**[English](README.en.md)** · 本文件为**完整复刻教程（简体中文）**
+[简体中文](README.md) · [English](README.en.md)
+
+[报告问题](https://github.com/FanBB2333/CBD/issues/new?labels=bug) ·
+[功能建议](https://github.com/FanBB2333/CBD/issues/new?labels=enhancement)
 
 </div>
 
----
-
-> **CBD（CellBridge-Docker）/ QNAP：** 请从 [QNAP 容器部署与语音接入](docs/deployment/qnap.md) 开始。
-> 该适配参考 dontmove-kit；QNAP 正式容器已运行，USB AT、ADB、UAC、SIP 鉴权及一次 YakPhone 真实来电的双向声音已确认通过。出站通话、长通话及锁屏推送仍待验收；下文上游 fnOS 的结论不代表 QNAP 已通过这些测试。
-
-# CellBridge：QDC507 4G 模块 + NAS 网关 + YakPhone 全链路（语音/短信/来电）
-
-> 目标：让任何用户按照本文档，从零复刻一套"SIM 卡装在 QDC507 模块上，iPhone 通过 YakPhone 打 VoLTE 电话、收发短信"的完整系统。
-> 本文档所有命令均为 **2026-09-06 真机实测通过** 的最终形态。系统已实现：拨出有声、来电振铃+推送、短信收发、挂断重拨无 500。
-
----
+> [!IMPORTANT]
+> CBD 目前只在一台 QNAP NAS 上完成了实机验收，还有若干场景未验收（见[限制](#限制)），
+> 暂不建议用来承接主号。模块侧语音运行时是厂商闭源二进制，不随本仓库分发。
 
 ## 目录
 
-1. [总体拓扑](#1-总体拓扑)
-2. [硬件准备](#2-硬件准备)
-3. [Tailscale 组网](#3-tailscale-组网)
-4. [编译 Gateway（arm64 + x86 双架构）](#4-编译-gatewayarm64--x86-双架构)
-5. [部署到 NAS](#5-部署到-nas)
-6. [config.yaml 与 SIP 参数](#6-configyaml-与-sip-参数)
-7. [YakPhone 客户端配置](#7-yakphone-客户端配置)
-8. [语音链路（拨出/来电）](#8-语音链路拨出来电)
-9. [短信链路（收发）](#9-短信链路收发)
-10. [PushKit 推送（来电/短信唤醒）](#10-pushkit-推送来电短信唤醒)
-11. [自测脚本](#11-自测脚本)
-12. [八层排查方法论（§36）](#12-八层排查方法论36)
-13. [已知坑与规避（踩坑实录）](#13-已知坑与规避踩坑实录)
-14. [安全与话费保护](#14-安全与话费保护)
-15. [开源信息与法律](#15-开源信息与法律)
+1. [关于项目](#关于项目)
+2. [快速开始](#快速开始)
+3. [用法](#用法)
+4. [文档](#文档)
+5. [开发](#开发)
+6. [限制](#限制)
+7. [贡献](#贡献)
+8. [许可证](#许可证)
+9. [致谢](#致谢)
 
----
+## 关于项目
 
-## 1. 总体拓扑
+CBD（CellBridge-Docker）派生自 [CellBridge](https://github.com/mccding/CellBridge)。
+SIM 卡插在 QDC507 模块里，模块通过 USB 接到 NAS；NAS 上的网关容器充当 SIP 服务器，
+iPhone 上的 YakPhone 通过 Tailscale 注册后，就能用这张卡打电话、收发短信。
 
-```text
-                ┌──────────────────────────────┐
-                │           iPhone             │
-                │      YakPhone (baresip)      │
-                │  SIP 5060/UDP + RTP PCMU     │
-                │  PushKit（来电唤醒/短信）      │
-                └───────────┬──────────────────┘
-                            │ Tailscale (tailnet 直连, 无 NAT)
-                            ▼
-                ┌──────────────────────────────┐
-                │        NAS (fnOS/ARM64)      │
-                │   cellbridge-gateway 进程     │
-                │   ├── SIP 服务器 0.0.0.0:5060 │
-                │   ├── RTP 桥 (PCMU/8000)      │
-                │   ├── 短信引擎 (AT+CMGS/CMGW) │
-                │   └── 语音路由管理 (mavo)      │
-                └───────────┬──────────────────┘
-                            │ USB (UAC: hw:0,0 + AT: ttyUSB2)
-                            ▼
-                ┌──────────────────────────────┐
-                │   QDC507 4G 模块 (DJI 一代)   │
-                │   ├── mavo-pcm-bridge (语音路由)│
-                │   ├── qdc507_aprv3/voice.ko   │
-                │   └── SIM 卡 (联通/移动/电信)   │
-                └───────────┬──────────────────┘
-                            │ 蜂窝网 (VoLTE)
-                            ▼
-                    10010 客服 / 任意电话号
+```mermaid
+flowchart LR
+    Y[iPhone · YakPhone] <-->|SIP/RTP over Tailscale| G[NAS · 网关容器]
+    G -->|USB：AT、ADB| Q[QDC507 + SIM]
+    Q <-->|USB Audio：8 kHz 单声道| G
+    Q <-->|VoLTE| N[蜂窝网络]
 ```
 
-**架构要点（最终定稿，勿改）：**
-- **NAS 是 SIP 服务器**（不是 HTTP API）；YakPhone 直接注册 NAS:5060，不经过任何中转 HTTP。
-- **语音 = SIP/RTP（PCMU 8000Hz, 第一阶段不启用 TLS/SRTP/STUN/TURN）**；tailnet 内直连无 NAT，`turn:` 全部留空。
-- **VoLTE 语音路由**：模块侧 `mavo-pcm-bridge --voice-route-session` 打开 `hw:0,4`（VoLTE PCM），USB UAC（`f_audio`）把 PCM 流到 NAS 的 `hw:0,0`（arecord/aplay）。
-- **短信**：YakPhone 通过 **SIP MESSAGE** 发给 NAS → NAS 用 `AT+CMGS`（短号文本 / 长号 PDU）经 ttyUSB2 发给模块。收短信 = 模块 `+CMTI` URC → NAS 入库 → `push.yakteam.com` 推送唤醒 YakPhone。
-- **PushKit**：NAS 调 `POST https://push.yakteam.com/v1/notify`（type=voip / missed / message）把来电和短信推给 YakPhone。
+### 能做什么
 
----
+- **打电话、接电话**：YakPhone 拨号经模块走 VoLTE；来电转到手机振铃，锁屏时由 PushKit 唤醒。
+- **收发短信**：支持中文、长短信和运营商短号；手机离线时短信存在 NAS，重新连上后补收。
+- **保留记录**：通话记录和短信存入 SQLite。
+- **放在 NAS 上常驻**：不需要一台一直开着的 Mac，也不需要在宿主上装串口驱动。
 
-## 2. 硬件准备
+### 与 CellBridge 的区别
 
-| 部件 | 说明 | 备注 |
+| | CellBridge | CBD |
 |---|---|---|
-| QDC507 4G 模块 | DJI 第一代 4G 模块（Baiwang 固件），USB ID `2C7C:0125`，内含高通 MDM9607 + eSIM/实体 SIM 槽 | 必须带 **adb 功能**（USB 枚举里有 adb port），否则无法推送模块运行时 |
-| SIM 卡 | 国内三大运营商任意（本教程以联通实测）；需开通 VoLTE | 通话质量依赖 VoLTE 注册（`AT+CEREG`=1） |
-| NAS/server | 任意 x86_64 / arm64 Linux，有 USB 口、能装 Tailscale | 实测环境：fnOS（飞牛）arm64 |
-| iPhone | iOS 12+ / iOS 26 实测 | 安装 YakPhone（App Store：Yak – AI SIP Phone） |
-| USB 线 | 数据线（非纯充电线） | — |
+| 部署 | fnOS 裸机 + systemd | Docker 容器，非特权（`cap_drop: ALL`） |
+| AT 串口 | 需要宿主提供 `ttyUSB` 驱动 | 容器内 libusb→PTY 桥接，宿主无需驱动 |
+| 模块初始化 | 脚本会修改 VID/PID | 默认只读；只开启 ADB/UAC，先备份原值 |
+| SIP 鉴权 | 占位实现（只检查是否带 `Authorization` 头） | 完整 Digest 鉴权，防重放 |
+| 呼叫控制 | 不处理 ACK；振铃时取消会被阻塞 | 完整 INVITE 事务；取消立即生效；挂断经 CLCC 确认 |
+| 代理与 NAT | RTP 固定发往 SDP 端口 | 学习实际 RTP 端口，手机开着 Surge 等代理也能通话 |
+| 上行延迟 | 播放缓冲约 1 秒 | 80 ms 环形缓冲，声卡侧实测 21–41 ms |
+| 连续通话 | 取消后的下一通可能无声 | 每通电话重建音频路由 |
+| 短信 | SIP 重传可能导致重复发送 | 持久化去重；长短信可断点恢复；离线补收 |
+| 锁屏来电 | token-only 推送格式 | YakPhone Pro Token 回调；手机已振铃时不重复推送 |
 
-**模块 USB 枚举检查**（接上 NAS 后）：
+### 技术栈
 
-```bash
-lsusb            # 应出现 BAIWANG / 2C7C:0125
-ls -la /dev/ttyUSB*          # ttyUSB0(diag) ttyUSB1(nmea) ttyUSB2(AT) ...
-cat /proc/asound/cards       # 应出现 "BAIWANG Baiwang ... (USB Audio)" -> hw:0,0
+- [Go](https://go.dev/) 1.25：网关、SIP/RTP、短信引擎
+- [PyUSB](https://github.com/pyusb/pyusb) + [libusb](https://libusb.info/)：USB AT 桥接
+- [SQLite](https://www.sqlite.org/)（[modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite)）：通话与短信存储
+- [Docker](https://www.docker.com/) Compose 和 [Tailscale](https://tailscale.com/)
+
+## 快速开始
+
+你需要：
+
+- QDC507 模块（DJI 一代 4G 模块，USB ID `2ca3:4006` 或 `2c7c:0125`）
+- 已开通 VoLTE 的 SIM 卡
+- 带 USB 口、能跑 Docker 的 Linux NAS（已验证 QNAP QTS 5.2，x86_64）
+- NAS 和 iPhone 在同一个 Tailscale tailnet
+- iPhone 上的 [YakPhone](https://apps.apple.com/cn/app/yak-ai-sip-%E7%94%B5%E8%AF%9D/id6763033863)；锁屏来电需要 Pro
+
+以下命令以 QNAP 为例，在 NAS 上执行。QNAP 的 `docker` 位于 Container Station 目录：
+
+```sh
+cs_path=$(getcfg container-station Install_Path -f /etc/config/qpkg.conf)
+export PATH="$cs_path/bin:$PATH"
+git clone https://github.com/FanBB2333/CBD.git && cd CBD
 ```
 
-**第一步：识别 AT 串口（可能不是 ttyUSB2！）**
+1. **检查宿主**（只读）：确认 Docker、模块的 USB 设备和 USB 声卡都已识别。
 
-模块通过 USB 枚举出 4 个串口，角色固定：
-
-```text
-ttyUSB0 = Diag（诊断）
-ttyUSB1 = NMEA（GPS）
-ttyUSB2 = AT（拨号/短信/配置）   ← 绝大多数情况是 ttyUSB2
-ttyUSB3 = Modem（PPP 数据）
-```
-
-> ⚠️ **不要凭编号猜**：不同主板/USB Hub 的枚举顺序可能不同（有的 AT 口是 ttyUSB4、ttyUSB6）。**用命令识别，不要看编号**：
-
-```bash
-# 方法 1（推荐）：仓库自带脚本自动识别
-git clone https://github.com/mccding/CellBridge   # 若还没克隆
-./CellBridge/scripts/detect-at-port.sh            # 输出 AT 口路径，如 /dev/ttyUSB2
-
-# 方法 2（手动）：逐个串口发 AT 看谁回 OK
-for p in /dev/ttyUSB*; do
-  echo "--- $p ---"
-  (stty -F $p 9600 raw -echo; printf 'AT\r' > $p; timeout 1 cat $p) 2>/dev/null
-done
-# 输出中出现 "OK" 的那个口就是 AT 口
-
-# 方法 3（by-id 稳定路径，配好后重启不变）：
-ls -l /dev/serial/by-id/ | grep -E "if0[2-9]|if03"   # 找到 ...-if02-... 或 ...-if03-...
-# AT 口一般是 if02 或 if03 结尾的 by-id（BAIWANG_Baiwang-if02-port0 等）
-```
-
-确定 AT 口后，下文所有 AT 命令都用 `<AT口>` 表示（如 `/dev/ttyUSB2` 或 by-id 路径）。
-
-**第二步：解锁 adb root（新用户模块出厂锁定，必须先做！）**
-
-模块出厂 **adb 被 QADBKEY 挑战锁住**——`AT+QADBKEY?` 返回一个 8 位随机挑战值（如 `+QADBKEY: 12345678`），不解锁的话 `adb devices` 看不到设备、usbcfg 写 adb 位会被拒。
-
-**解锁方法是公开的**：高通模块的 QADBKEY 挑战-应答使用**固定密钥 `SH_adb_quectel`**（见 [dji-voice-go/qadbkey.go](https://github.com/iniwex5/dji-voice-go) 等开源实现）——用 glibc MD5-crypt（`$1$<challenge>$`）对固定密钥计算哈希，取 22 字符哈希段作为解锁密码，`AT+QADBKEY="<密码>"` 即解锁成功，**持久生效（跨重启，只需一次）**。
-
-**一键完成（自动识别 AT 口 → 自动解锁 adb root → 写 usbcfg 7×1 → 重启）**：
-
-```bash
-./scripts/init-module.sh             # 一键：出厂锁定模块也直接解锁+开启
-./scripts/init-module.sh /dev/ttyUSB2   # 指定 AT 口
-./scripts/init-module.sh --check     # 只查状态不写
-```
-
-手动等价步骤（了解原理用）：
-
-```bash
-# 1. 取挑战值
-AT+QADBKEY?                          # → +QADBKEY: 12345678
-# 2. 计算解锁密码 = MD5-crypt(SH_adb_quectel, $1$12345678$) 的 22 字符哈希段
-#    可用 openssl passwd -1 -salt 12345678 SH_adb_quectel 得到 $1$12345678$UnSn...，
-#    密码就是 "UnSn..." 部分（22 字符）
-# 3. 解锁（持久生效）
-AT+QADBKEY="<YOUR-22-char-password>"  # → OK
-# 4. 验证：adb devices 出现设备
-```
-
-解锁后 adb 以 **root** 运行（`adb shell id -u` → `0`），gateway 才能推送运行时、insmod 内核模块。
-
-> 已解锁的模块重复执行解锁指令会返回非 OK（拒绝重复解锁）——正常，脚本会跳过。**你的模块如果之前开过 adb，直接跑脚本即可，它会自动检测并跳过。**
-
-重启后验证（应出现 adb 端口 + 音频设备）：
-
-```bash
-lsusb                     # 仍见 2C7C:0125
-adb devices -l            # 出现 QDC507 设备（transport usb:...）
-cat /proc/asound/cards    # 出现 BAIWANG ... (USB Audio) -> hw:0,0
-```
-
-> ⚠️ **不要改 Tailscale / fnOS 系统配置**。模块工作模式固定 UAC+adb。
-
-**模块侧语音运行时要件**（放 NAS 上，`runtime_dir` 指向这里；文件来自模块原厂/用户提供，**不随开源仓库分发**）：
-
-```text
-/opt/cellbridge/module-voice/
-├── qdc507_aprv3.ko          # APR v3 内核模块（固定 hash 校验）
-├── qdc507_voice.ko          # Voice/AFe 内核模块（固定 hash 校验）
-├── mavo-pcm-bridge.armv7    # MaVo PCM 路由二进制（--voice-route-session）
-└── alsaucm                  # 音频路由校准工具（内含 VoLTE verb 配置）
-```
-
----
-
-## 3. Tailscale 组网
-
-### 3.1 NAS 安装并登录（Tailscale authkey 步骤）
-
-```bash
-# 1. NAS 安装 Tailscale（fnOS/Debian 系）:
-#    curl -fsSL https://tailscale.com/install.sh | sh
-#    或按 https://tailscale.com/download 对应发行版安装
-
-# 2. 获取 authkey（登录凭据）:
-#    Tailscale Admin Console → Settings → Keys → Generate auth key
-#    → 复制生成的 `tskey-auth-...` 一次性密钥
-
-# 3. 用 authkey 登录你的 tailnet（只执行一次）:
-tailscale up --authkey=tskey-auth-XXXX --hostname cellbridge-nas
-
-# 4. 验证已上线并记录 tailnet IP:
-tailscale status
-tailscale ip -4        # 记录，例：100.x.y.z（下文配置用域名代替）
-```
-
-### 3.2 iPhone 安装并登录
-
-1. App Store 安装 **Tailscale**，登录**同一个 tailnet 账号**（与 NAS 同一账号；authkey 只在 NAS 用一次，iPhone 用账号密码登录即可）。
-2. 验证：iPhone Tailscale App 显示两台设备在线。
-
-### 3.3 启用 MagicDNS（必须，SIP 配置依赖域名）
-
-Tailscale Admin Console → **DNS** → 勾选 **MagicDNS** 开启。
-
-> 域名格式：`<主机名>.<tailnet名>.ts.net`（例：`cellbridge-nas.<你的tailnet>.ts.net`）。下文所有 `<你的NAS>.ts.net` 都指它。
-
-### 3.4 网络检查
-
-1. 从 iPhone Ping 通 NAS 域名：
-   ```bash
-   # iPhone 上（或任意 tailnet 内机器）
-   ping cellbridge-nas.<你的tailnet>.ts.net
+   ```sh
+   sh scripts/qnap-preflight.sh
    ```
-2. 默认 tailnet 内直连即可，**不需要任何 ACL 修改**。
 
-> 为什么不加 TURN：tailnet 内两台设备直连，无 NAT 无中继，`turn:` 留空即可。旧 WebRTC 时代的 coturn:3478 是遗留，本链路不用。
+2. **初始化模块**：开启模块的 ADB 和 USB 音频（UAC）。
+   `gateway/tools/init_usb.py` 默认只读，只有显式传入 `--apply --backup <文件>`
+   才会写入并重启模块。具体步骤和回退方法见[部署指南](docs/deployment/qnap.md)。
 
----
+3. **下载模块语音运行时**：文件按固定 SHA-256 校验，不打进镜像。
 
-## 4. 编译 Gateway（arm64 + x86 双架构）
+   ```sh
+   mkdir -p /share/Container/cbd/data
+   python3 scripts/fetch-voice-runtime.py --dest /share/Container/cbd/module-voice
+   ```
 
-### 4.1 源码结构
+4. **构建镜像**：国内网络可通过 `GO_IMAGE`、`GOPROXY`、`DEBIAN_MIRROR` 等 build-arg 换源，
+   示例见 [`.env.qnap.example`](infra/docker/.env.qnap.example)。
 
-```text
-cellbridge/
-├── gateway/
-│   ├── cmd/cellbridge-gateway/     # 主程序（SIP + RTP + SMS + 语音路由管理）
-│   ├── internal/
-│   │   ├── sip/                    # SIP 服务器（注册/拨出/来电/MESSAGE 短信）
-│   │   │   ├── server.go           # 服务器主逻辑（INVITE/BYE/MESSAGE…）
-│   │   │   ├── session.go          # 通话会话（Dial/AwaitBridge/Hangup, 15s 有界超时）
-│   │   │   ├── media.go            # MediaSession RTP（seq++, ts+=160, PCMU/8000）
-│   │   │   ├── registrar.go        # 注册表
-│   │   │   ├── auth.go             # Digest 认证
-│   │   │   └── yakpush.go          # push.yakteam.com 推送（voip/missed/message）
-│   │   ├── voice/
-│   │   │   ├── alsa.go             # NAS 侧 arecord/aplay 管理（capture-first 时序）
-│   │   │   ├── bridge.go           # PCM↔RTP 桥 + 统计日志（peak/nonzero/mean）
-│   │   │   └── qdc507/audio.go     # 模块侧运行时：insmod/mavo/校准/每通 rotating
-│   │   ├── modem/at/               # AT 适配器（SMS 短号文本/长号 PDU, dry-run 保护）
-│   │   ├── api/server.go           # HTTP API (8787) + SMS 引擎接线 + push
-│   │   └── sms/engine.go           # 短信引擎（入库 + 发送 + 推送）
-│   └── Dockerfile                  # 多阶段构建（TARGETARCH 可切换）
-└── infra/
-    ├── config.example.yaml          # 通用配置模板
-    └── config.nas-qdc507.example.yaml  # QDC507 NAS 专用模板
-```
+   ```sh
+   docker build --platform linux/amd64 -f gateway/Dockerfile -t cellbridge-gateway:qnap .
+   ```
 
-### 4.2 本地交叉编译（推荐，最快）
+5. **编写配置**：从 [`config.qnap.example.yaml`](infra/config.qnap.example.yaml) 复制，
+   修改以下字段：
 
-```bash
-cd gateway
+   ```sh
+   cp infra/config.qnap.example.yaml /share/Container/cbd/config.yaml
+   ```
 
-# arm64（飞牛/树莓派/NAS 常见架构）
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
-    -o /tmp/cellbridge-gateway-arm64 ./cmd/cellbridge-gateway
+   ```yaml
+   modem:
+     usb_path: 1-2                  # 模块所在的物理 USB 端口
+   voice:
+     enabled: true                  # 模块初始化通过后再开启
+     bootstrap: true
+     rx_path: hw:CARD=Baiwang,DEV=0
+     tx_path: hw:CARD=Baiwang,DEV=0
+   sip:
+     enabled: true
+     listen: 100.x.y.z:5060         # NAS 的 Tailscale 地址
+     users:
+       - username: iphone
+         password: <随机密码>
+   ```
 
-# x86_64
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
-    -o /tmp/cellbridge-gateway-amd64 ./cmd/cellbridge-gateway
-```
+6. **启动**：
 
-**一键脚本（推荐，双架构同时出）**——仓库自带 `scripts/build.sh`：
+   ```sh
+   cp infra/docker/.env.qnap.example infra/docker/.env   # 填写 NAS 上的绝对路径
+   docker compose --env-file infra/docker/.env -f infra/docker/docker-compose.qnap.yml config --quiet
+   docker compose --env-file infra/docker/.env -f infra/docker/docker-compose.qnap.yml up -d --no-build
+   curl -fsS http://127.0.0.1:8787/api/v1/health
+   ```
 
-```bash
-./scripts/build.sh          # 一次产出 arm64+amd64 双二进制 + SHA256SUMS 到 artifacts/
-./scripts/build.sh docker   # 追加构建 Docker 镜像（本机架构）
-./scripts/build.sh docker-all  # buildx 双平台镜像（arm64+amd64）
-```
+   健康接口只说明进程在运行；模块和语音是否就绪，以手机实际注册和通话为准。
 
-### 4.3 Docker 双平台镜像（x86 + arm）
+## 用法
 
-仓库自带 `gateway/Dockerfile`，支持 `TARGETARCH`：
+### 连接 YakPhone
 
-```bash
-cd cellbridge
-
-# 单架构
-docker build --build-arg TARGETARCH=arm64 -f gateway/Dockerfile -t cellbridge-gateway:arm64 .
-docker build --build-arg TARGETARCH=amd64 -f gateway/Dockerfile -t cellbridge-gateway:amd64 .
-
-# 双平台一份推送（需要 buildx + 远程 builder 或同一架构上做 manifest）
-docker buildx build --platform linux/arm64,linux/amd64 \
-    --build-arg TARGETARCH=placeholder \
-    -f gateway/Dockerfile -t yourrepo/cellbridge-gateway:latest --push .
-```
-
-> Dockerfile 基础镜像 `golang:1.25-bookworm` + 运行时镜像 `debian:bookworm-slim`（自带 alsa-utils，NAS 上无需额外装 arecord/aplay）。注意：Dockerfile 里 `--build-arg TARGETARCH=placeholder` 需要 buildx 自动注入 `TARGETARCH`（Docker 内置变量），单架构时显式传 `--build-arg TARGETARCH=arm64`。
-
-### 4.4 GitHub Actions 自动编译（开源后开箱即用）
-
-仓库自带 `.github/workflows/build.yml`，**推 tag 自动出全部产物**：
-
-```bash
-git tag v1.0.0 && git push origin v1.0.0
-```
-
-工作流自动做三件事：
-
-| 步骤 | 产出 |
+| 设置 | 值 |
 |---|---|
-| `binaries` job（matrix: arm64+amd64） | `cellbridge-gateway-linux-arm64` / `-amd64` 静态二进制 |
-| `docker` job（buildx 双平台） | `ghcr.io/<你的repo>:v1.0.0` + `:latest`（linux/arm64 + linux/amd64） |
-| `release` job（tag 时） | GitHub Release + 两个二进制 + `SHA256SUMS.txt` |
+| 服务器 | `<NAS 的 Tailscale 地址或 MagicDNS 名>:5060` |
+| 传输 | UDP |
+| 用户名 / 密码 | `sip.users` 中的配置 |
+| 编解码 | PCMU 优先 |
+| STUN / TURN | 关闭 |
 
-手动触发：GitHub 仓库页 **Actions → build → Run workflow**，不推 tag 也能编译。
+注册成功后即可拨号。发短信时，在 YakPhone 的消息界面输入完整号码。
 
-### 4.5 单元测试
+### 开启锁屏来电
 
-```bash
+需要 YakPhone Pro。
+
+1. 在配置中设置 `sip.push_callback_listen: 127.0.0.1:8788` 并重启容器。
+   网关会生成 `data/yakphone-push.json`（权限 0600），其中包含 `callback_key`。
+2. 用 Tailscale Serve 把 HTTPS 8443 转到回调端口（仅 tailnet 内可访问，不要开 Funnel）：
+
+   ```sh
+   tailscale serve https:8443 / http://127.0.0.1:8788   # Tailscale 1.40 语法
+   ```
+
+3. 在 YakPhone 里把 Token 回调 URL 填为
+   `https://<NAS 的 ts.net 主机名>:8443/token/<callback_key>`。
+
+如果手机已经通过 SIP 振铃，网关就不再发推送，避免同一通来电响两次。
+
+### 开启短信
+
+首次部署默认不收件，发送也只是 dry-run。确认无误后：
+
+- 在配置中设置 `sms.inbox_enabled: true`；
+- 在 `.env` 中设置 `CELLBRIDGE_SMS_DRY_RUN=false`。
+
+关闭 dry-run 后，发送会真实提交给运营商并计费。
+
+### 其他 Linux 主机
+
+如果宿主已经有 `ttyUSB` 串口驱动（例如 fnOS），可以设置 `modem.transport: serial`，
+然后按[上游教程](docs/CellBridge.md)部署。
+
+## 文档
+
+- [QNAP 部署指南与实测记录](docs/deployment/qnap.md)：模块初始化、容器权限、各项修复与验收结果
+- [CellBridge 完整教程](docs/CellBridge.md)：上游的串口部署、八层排查方法和踩坑表
+- [运维与管理](docs/operations/admin.md)
+- [架构决策记录](docs/architecture/)
+- [第三方声明](ThirdParty/ThirdPartyNotices.md)
+
+## 开发
+
+```sh
 cd gateway
+go test ./...
+go test -race ./internal/config ./internal/modem/... ./internal/sip ./internal/voice/...
 go vet ./...
-go test ./...        # 覆盖：RTP 时序、SIP 重传去重、SMS dry-run(CMGW)、modem URC 解析
+cd ..
+python3 -m unittest discover -s gateway/tools -p 'test_*.py'
 ```
 
----
-
-## 5. 部署到 NAS
-
-### 5.0 一键部署（推荐，唯一必须的命令）
-
-仓库自带 `scripts/deploy.sh`——**编译 → 备份 → 上传 → 替换 → 重启 → 验证** 一条命令完成：
-
-```bash
-./scripts/deploy.sh                      # 默认部署到 <你的NAS>（tailnet SSH 主机名）
-NAS_HOST=my-nas ./scripts/deploy.sh      # 指定 NAS 主机名
-./scripts/deploy.sh --no-build           # 跳过编译，只上传已有产物
-```
-
-前置条件：本机已加入 tailnet 且 `tailscale ssh root@<NAS>` 可用。部署前脚本自动把 NAS 上当前运行的二进制备份为 `.pre-deploy-<时间戳>`，失败可随时回滚。
-
-### 5.1 手动部署（了解细节用）
-
-目录与 systemd 服务（非 Docker 直装，实测路径）：
-
-```bash
-# NAS 上
-mkdir -p /mnt/docker-compose/cellbridge-gateway/{bin,data}
-scp /tmp/cellbridge-gateway-arm64 root@<NAS>:/tmp/cellbridge-gateway.new
-ssh root@<NAS> 'mv /tmp/cellbridge-gateway.new /mnt/docker-compose/cellbridge-gateway/bin/cellbridge-gateway && chmod +x .../bin/cellbridge-gateway'
-```
-
-systemd 服务（`/etc/systemd/system/cellbridge-gateway.service`）：
-
-```ini
-[Unit]
-Description=CellBridge Gateway (Tailnet-only)
-Wants=network-online.target tailscaled.service
-After=network-online.target tailscaled.service docker.service
-
-[Service]
-Type=simple
-User=root
-EnvironmentFile=/mnt/docker-compose/cellbridge-gateway/turn.env
-# --listen 127.0.0.1 = HTTP API 仅绑定本机（安全）；外部统一走 tailnet 域名（Tailscale Serve 443 → 127.0.0.1:8787）
-ExecStart=/mnt/docker-compose/cellbridge-gateway/bin/cellbridge-gateway \
-    --config /mnt/docker-compose/cellbridge-gateway/config.yaml \
-    --listen 127.0.0.1:8787 \
-    --data-dir /mnt/docker-compose/cellbridge-gateway/data
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-systemctl daemon-reload
-systemctl enable --now cellbridge-gateway
-systemctl is-active cellbridge-gateway    # -> active
-ss -lnup | grep 5060                      # SIP UDP 监听确认
-```
-
-### 5.2 部署上线流程（安全，避免直接覆盖）
-
-```bash
-scp cellbridge-gateway-arm64 root@<NAS>:/tmp/cellbridge-gateway.new
-ssh root@<NAS> '
-  mv /tmp/cellbridge-gateway.new /mnt/docker-compose/cellbridge-gateway/bin/cellbridge-gateway
-  chmod +x /mnt/docker-compose/cellbridge-gateway/bin/cellbridge-gateway
-  systemctl restart cellbridge-gateway
-  sleep 4
-  systemctl is-active cellbridge-gateway'
-```
-
-> ⚠️ `systemctl stop` 可能被 NAS 安全策略拦截；`restart` 通常可用。被拦时给出手动命令由用户执行。
-
----
-
-## 6. config.yaml 与 SIP 参数
-
-### 6.0 用户必填项（三个凭据，缺一不可）
-
-创建 `config.yaml` 前，先备齐下列三个值——**它们全部来自你自己，仓库不提供**：
-
-| # | 凭据 | 从哪里获取 | 填到 config 哪里 |
-|---|---|---|---|
-| 1 | **NAS ts.net 域名** | §3.3 MagicDNS 开启后，NAS 上 `tailscale status` 显示的 `<主机名>.<tailnet名>.ts.net` | `network.tailnet_hostname` |
-| 2 | **SIP 账号+密码** | **自己定**（示例 `1001`；密码自定义，之后必须原样填进 YakPhone） | `sip.users[0].username/password` |
-| 3 | **YakPhone push token** | **YakPhone App 内获取**：打开 Yak → 设置/账号页 → 复制 PushKit token（一串 Base64 字符） | `sip.push_token` |
-
-> ⚠️ 三个值都属私有凭据：不要提交到 git、不要截图外发。YakPhone token 不填则**来电和短信不会推送**（App 未打开时无法振铃）。
-
-**实测最终配置**（部署在 NAS `/mnt/docker-compose/cellbridge-gateway/config.yaml`；`push_token` 处放你自己的 YakPhone 推送 token）：
-
-```yaml
-network:
-  mode: tailnet
-  tailnet_hostname: <你的NAS>.ts.net   # ← 换成你的 NAS ts.net 域名
-  public_fallback: false
-server:
-  listen: 127.0.0.1:8787   # HTTP API 仅绑定本机回环（安全默认）；外部一律经 tailnet 域名访问
-  public_base_url: ""
-data:
-  dir: /mnt/docker-compose/cellbridge-gateway/data
-modem:
-  adapter: qdc507
-  tty: /dev/serial/by-id/usb-BAIWANG_Baiwang-if02-port0   # 稳定 by-id 路径（勿用 ttyUSB2 裸名）
-  baud: 9600
-  allow_usb_identity_changes: false
-voice:
-  enabled: true
-  backend: qdc507
-  codec: pcmu
-  sample_rate: 8000
-  rx_path: hw:0,0
-  tx_path: hw:0,0
-  runtime_dir: /opt/cellbridge/module-voice
-sip:
-  enabled: true
-  listen: 0.0.0.0:5060   # SIP 监听所有网卡（tailnet 客户端经 ts.net 域名连入）；0.0.0.0 = 绑定地址, 非连接目标
-  realm: cellbridge
-  push_token: "<你的 YakPhone 推送 token>"      # [REDACTED in repo example]
-  users:
-    - username: "1001"
-      password: "<你的 SIP 密码>"                # [REDACTED in repo example]
-webrtc:
-  remote_ice_policy: relay
-  local_ice_policy: all
-  media_network_policy: tailnet-turn
-  turn_credential_ttl: 10m
-  private_turn:
-    enabled: false           # ← 第一阶段禁用 TURN（tailnet 直连）
-    host: ""
-    port: 3478
-    bind_ip: ""
-push:
-  mode: broker
-  broker_url: https://push.example.com    # 旧 APNs 通道占位；实际短信/来电推送走 push.yakteam.com
-recording:
-  enabled: true
-  retention_days: 90
-  minimum_free_bytes: 524288000
-  auto_mode: off
-security:
-  pairing_local_only: true
-  admin_local_only: true
-  redact_logs: true
-```
-
-**SIP 参数基线（勿乱改）：**
-
-| 参数 | 值 | 说明 |
-|---|---|---|
-| 域名 | `<你的NAS>.ts.net` | tailnet MagicDNS |
-| 端口 | 5060/UDP | 第一阶段不用 TLS |
-| 账号 | `1001` / realm `cellbridge` | Digest 认证 |
-| Codec | PCMU (PCMA=0) / 8000 Hz / mono | baresip 严格解析，2xx 必须带 Contact+Allow |
-| SDP | `c=IN IP4 <tailnetIP>` | RTP 目的=INVITE 源 IP + SDP 端口（**无视 SDP c= 行 IP**，YakPhone 会写公网 IP） |
-| TURN/STUN/SRTP | 全部留空/关闭 | tailnet 直连无 NAT |
-
----
-
-## 7. YakPhone 客户端配置
-
-1. App Store 安装 **Yak – AI SIP Phone**（baresip 内核）：
-   👉 [https://apps.apple.com/in/app/yak-ai-sip-phone/id6763033863](https://apps.apple.com/in/app/yak-ai-sip-phone/id6763033863)（免费）
-2. **获取 PushKit token（配置 NAS 前先做这一步）**：
-   YakPhone → 设置（Settings）→ 账号/推送（Push）页 → **复制 Push Token**（一串 Base64 字符，形如 `AAA...==`）→ 填到 NAS `config.yaml` 的 `sip.push_token`。
-   > 若 App 内找不到该页：在 Yak 设置里找 "PushKit" 或 "APNs Token" 字样；不同版本入口名称可能略有差异。
-3. 账号设置：
-   - **服务器**：`<你的NAS>.ts.net:5060`
-   - **用户名**：`1001`；**密码**：与 config 一致
-   - **传输**：UDP
-   - **Codec 顺序**：PCMU（或 G711u）优先；第一阶段**不要用 Opus**
-4. 注册成功后拨号界面出现"已注册"状态。
-5. 短信：在 YakPhone 会话/消息界面输入**完整手机号**（如 `13800138000`）和内容发送——YakPhone 走 **SIP MESSAGE** 到 NAS，由 NAS 转 AT+CMGS 真发。
-
-> 若拨号/短信按钮无反应：确认 NAS 侧 `journalctl -u cellbridge-gateway -f` 能看到 `sip register user=1001`；看不到说明注册没到 NAS（排查网段/防火墙）。
-
----
-
-## 8. 语音链路（拨出/来电）
-
-### 8.1 拨出（outbound）最终状态机
-
-```text
-YakPhone → INVITE (sip:10010@domain)
-NAS: 100 Trying
-NAS: Dial() → ① PrepareRoute: 每通电话前强制 rotating（killall mavo → 重建会话，绕过 UAC "aplay 触碰后 capture 死"固件缺陷）
-      ② ATD10010; ③ WaitActive: 轮询 AT+CLCC 直到 state=0 (active)
-NAS: 180 Ringing (Contact: <sip:cellbridge@IP>)
-NAS: 蜂窝接通 → AwaitBridge(queue):
-      ensureRuntime（短路线由已备）→ ALSAAudio.Start（capture 先开，aplay 后开）
-NAS: 200 OK (Contact + Allow + SDP c=tailnetIP)
-YakPhone: ACK（NAS 不回包，丢弃）
-双向 RTP：PCMU/8000，NAS rtp=INVITE源IP+SDP端口，seq++/ts+=160
-BYE → 200 OK → Hangup()：清 bridge（杀 arecord/aplay）+ modem 线路（15s 有界 ATH）
-```
-
-**关键实现细节（勿回退）：**
-- **RTP 序号/时间戳必须递增**：`seq++`、`ts+=160`（每 20ms PCMU 帧）。恒 0 会被 baresip 按 RFC3550 判重复包丢弃 → 无声。
-- **ACK 不回 200**：ACK 是 INVITE 事务收尾，回 200 会让 YakPhone 状态机卡 ringing。
-- **200 OK 必带 `Contact` + `Allow`**：`<sip:cellbridge@IP>` + `Allow: INVITE, ACK, BYE, CANCEL, OPTIONS`；缺 Contact → baresip 报 badmessage。
-- **modem ended 事件清 active**：NO CARRIER/未接来电 → 清 `active` 标志，否则下通必 500 "active modem call exists"。
-- **ALSA 启动时机**：**必须等蜂窝接通（CLCC active）后才开 arecord/aplay**。拨号瞬间开 = UAC 未流化 → 永久全零。capture 先开、aplay 后开。
-- **串口防死锁**：Dial/Hangup 的 AT Exchange 一律 15s 有界超时，超时自动释放 ioMu 锁（否则一次 ATH 卡死 = 之后所有拨号全卡）。
-- **Call-ID 会话键 + 重传去重**：INVITE 重传时按 Call-ID 命中已有会话，回 180/200，不重复拨号。
-
-### 8.2 来电（inbound）
-
-```text
-模块: RING / +CLIP（AT+CLIP=1、CCWA=1 需预置）
-NAS HandleURC → incoming 事件（peer=主叫号码）
-NAS ringClients: 向所有已注册 SIP 账号发 INVITE（带 SDP）
-  + 同时 POST push.yakteam.com (type=voip, caller_uri, caller_name)
-YakPhone 振铃（CallKit）→ 接听 → ACK（NAS 丢弃）+ RTP 双向
-NO CARRIER / BYE → 清 active + 释放媒体
-```
-
-### 8.3 语音路由管理（QDC507）
-
-每通电话前（`Dial()` 内 `PrepareRoute`）：
-
-```text
-1. killall -9 mavo-pcm-bridge.armv7 （⚠️ 必须 -9 + 验证清零：[m]avo 正则防 pgrep 自匹配）
-2. 如无 mavo 残留：adb push 运行时（qdc507_aprv3.ko/qdc507_voice.ko/mavo-pcm-bridge）
-   到模块 /run/maccellular-call/（sbc hash 校验）
-3. insmod aprv3 → voice（幂等：test -d /sys/module/xxx || insmod）
-4. alsaucm 校准（VoLTE verb + AuxPcm Rx/Tx 使能，日志 "VoLTE enable 1"）
-5. sh /data/celldock-route-launch.sh 拉起 mavo（nohup + pid 文件 /run/celldock-voice-route.pid）
-6. 轮询 routeReadyScript（pid 文件/进程/日志 "VoLTE route session active on hw:0,4"/audio_enable/hw:0,4 RUNNING）直到 "ready"
-7. echo 1 > /sys/class/android_usb/f_audio/audio_enable
-```
-
-> ⚠️ **每通 rotating 是关键**：QDC507 UAC 固件的 capture 流在 arecord/aplay 触碰一次后会静音，只有**重建 mavo 会话**能恢复。实测：例行 rotating → 连续多通 nonzero=250 满血。
-
----
-
-## 9. 短信链路（收发）
-
-### 9.1 发送（YakPhone → SIP MESSAGE → AT+CMGS）
-
-```text
-YakPhone: MESSAGE sip:13800138000@domain SIP/2.0
-          Content-Type: text/plain
-          <正文>
-NAS: handleMessageRequest:
-     解析 Request-URI 号码 + 正文 → SMSEngine.Send(ctx, to, body)
-     → adapter.SendSMS:
-        ≤6 位短号（如 10010）→ AT+CMGF=1 + AT+CMGW/CMGS="短号" 文本模式
-        >6 位长号         → AT+CMGF=0 + PDU（AT+CMGS=<tpdu长度> + PDU + 0x1A）
-NAS → 200 OK
-```
-
-**SMS PDU 样例**（长号 185...）：`0001000B818155118865F50008044F60597D`（"你好"）。短号走文本模式避开 PDU `>` 提示符被 tty 抢占的问题。
-
-**HTTP API 发送**（等价于 MESSAGE，供脚本/集成用；在 NAS 本机执行时用 127.0.0.1，远程统一走 tailnet 域名）：
-
-```bash
-curl -X POST http://127.0.0.1:8787/api/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <device-token>" \
-  -H "Idempotency-Key: $(uuidgen)" \
-  -d '{"to":"13800138000","body":"测试"}'
-```
-
-### 9.2 接收（SIM → +CMTI → 入库 → 推送）
-
-```text
-模块 +CMTI: "ME",<idx> → NAS AT+CMGL 拉取 → 解码（gsm7/ucs2）→ 入库 messages 表
-→ sendMessagePush():
-   YakPush(type=message, caller_uri=sip:<发件人>, message_body=<正文>)  ← push.yakteam.com
-   （旧 APNs broker 未配置时忽略，不影响）
-→ YakPhone 收到通知，打开即见短信
-```
-
-### 9.3 话费保护（重要！）
-
-- 代码内置 **dry-run 开关**：`CELLBRIDGE_SMS_DRY_RUN` 环境变量，**默认 true**。
-- dry-run=true：短信走 `AT+CMGW`（仅存储到模块 ME，**不发送、不计费**）。
-- dry-run=false：走 `AT+CMGS`（真发，按运营商计费）。
-- systemd 中开启真发：在 `[Service]` 加 `Environment=CELLBRIDGE_SMS_DRY_RUN=false`。
-- 自测/复刻请**先保持 dry-run**，确认链路后再按需开启。
-
----
-
-## 10. PushKit 推送（来电/短信唤醒）
-
-> QNAP 当前部署状态（2026-10-01）：后台推送尚未启用。用户已开启 Tailscale VPN On Demand，
-> 但手机上的后台唤醒入口提示需要 YakPhone Pro。需先解锁或恢复相应权益，再取得该版本的推送接入配置。
-> 以下是仓库历史 token-only 接口格式；当前 YakPhone 官方介绍还提及 HMAC-SHA256 认证，
-> 不能仅填 token 就认定已兼容。须按应用提供的协议接入，并以锁屏真实呼入验证。
-> 当前进度见 [QNAP 部署记录](docs/deployment/qnap.md)。
-
-历史推送端点（用户提供、仓库中提供参数格式）：
-
-```http
-POST https://push.yakteam.com/v1/notify
-Content-Type: application/json
-
-{
-  "token": "<你的 PushKit token>",
-  "caller_uri": "sip:1000@pbx.example.com",
-  "caller_name": "1000",
-  "type": "voip" | "missed" | "message",
-  "message_body": "短信内容（type=message 时）"
-}
-```
-
-- **来电**：RING/+CLIP 事件时发 `type=voip` → YakPhone PushKit 唤醒，App 未开也能振铃。
-- **未接**：NO CARRIER 后发 `type=missed`（可选）。
-- **短信**：入库后发 `type=message` + `message_body` → YakPhone 通知栏出现短信。
-- token 从 config `sip.push_token` 读入；测试验证：`journalctl | grep yakpush` 应见 `yakpush sent type=message status="200 OK"`。
-
----
-
-## 11. 自测脚本
-
-仓库 `tools/` 提供（Mac 与 NAS 均可运行，纯 Python 无依赖）：
-
-| 脚本 | 作用 | 关键输出 |
-|---|---|---|
-| `sip_fresh.py` | 全链路自测：REGISTER(digest) → INVITE(新 Call-ID) → 200 → BYE | `200 OK` |
-| `sip_bye2.py` | 发起呼叫后立即 BYE（10s 窗口） | BYE→200 |
-| `sip_dump200.py` | 打印 200 OK 原文（验证 Contact/Allow/SDP） | 响应头 |
-| `readycheck.sh` | 模块语音路由 READY 逐项检查（pid/mavo/日志/audio_enable/hw RUNNING） | 每项 OK |
-| `mavotest.sh` | 手跑 mavo 启动脚本，验证 pid 文件写入 | `1156 7011235` 格式 |
-
-**语音心跳验证**（每通电话后看 NAS 日志）：
-
-```text
-voice cellular stats call_id=xxx frames=250 peak_max=32768 nonzero=250 mean=9000+
-```
-
-- `nonzero=250` 表示已统计的帧中有 250 帧含非零样本；噪声也会计入，不能单独证明通话可听清。
-- `nonzero=0` 表示全零；持续接近满幅需要检查削波或噪声，结合实际听感排查。
-- 上行 `queue_ms` / `queue_peak_ms` 表示应用缓冲深度，`dropped` / `underruns` 表示累计丢弃帧与缺帧事件；不代表全程延迟。
-
----
-
-## 12. 八层排查方法论（§36）
-
-遇到"无声/单通/拨号失败"按层从下往上查，**每层有明确证据才算过**：
-
-```text
-Layer 1  QDC507 固件: UAC=1（usbcfg 最后一位），AT+CFUN=1,1 生效
-Layer 2  ALSA: /proc/asound/card0/pcm0c/sub0/status = RUNNING
-         （通话中抓 arecord io：wchar 应持续增长，冻结=X RUN/死管道）
-Layer 3  PCM 峰值: NAS 手动 arecord 通话中应 peak 32768，nonzero 过半
-Layer 4  SIP: INVITE → 100/180 → 200 OK → ACK（重传按 Call-ID 去重）
-Layer 5  RTP: 双向包计数（tcpdump udp port 40000-40100 或 gateway stats）
-Layer 6  Codec: PCMU/8000/mono（勿 Opus）
-Layer 7  YakPhone: 注册状态、拨号/接听按钮、扬声器
-Layer 8  iOS: CallKit 是否接管、Audio Session route
-```
-
-**经典量化命令**：
-
-```bash
-# 1. ALSA 状态
-cat /proc/asound/card0/pcm0c/sub0/status
-# 2. 手动 capture 抓真实语音（gateway 停时）
-timeout 10 arecord -q -D hw:0,0 -t raw -f S16_LE -r 8000 -c 1 -d 8 /tmp/x.raw
-python3 -c "import struct;d=open('/tmp/x.raw','rb').read();s=struct.unpack('<%dh'%(len(d)//2),d[:len(d)//2*2]);print('peak',max(abs(int(x)) for x in s),'nonzero',sum(1 for x in s if x!=0))"
-# 3. 网关统计（每 250 帧即 5s 一条）
-journalctl -u cellbridge-gateway -f | grep 'voice cellular stats'
-```
-
----
-
-## 13. 已知坑与规避（踩坑实录）
-
-| # | 现象 | 根因 | 解法（已内置代码） |
-|---|---|---|---|
-| 1 | 拨打 500 错误 | 200 OK 缺 `Contact`；baresip 严格解析报 badmessage | 2xx 必带 Contact+Allow |
-| 2 | 挂断后重拨 500 | 未接来电 NO CARRIER 不清 modem active 标志 | ended 类 URC 自动清 active |
-| 3 | 接通但完全无声 | RTP 序号/时间戳恒 0 → baresip 判重复包全丢 | media.go seq++ / ts+=160 |
-| 4 | 呼叫到达 180 后永久振铃 | ACK 被回 200 → YakPhone 状态机卡 ringing | ACK 直接丢弃 |
-| 5 | 拨号卡死（之后全卡） | 22:39 BYE 的 ATH Exchange 无超时永久占 ioMu 串口锁 | Dial/Hangup 15s 有界超时 |
-| 6 | arecord 开在拨号瞬间→永久全零 | UAC gadget 未流化；"通话前开 capture"实验证实 | WaitActive（CLCC）等接通后才开 pair |
-| 7 | 第一通有声，之后全无声 | **UAC capture 被 aplay 触碰一次即静音**（固件缺陷）；多 mavo 残留互踩 audio_enable | **每通 rotating**：killall -9 + [m]avo pgrep 防自匹配 + 重建单 mavo 会话 |
-| 8 | `survivors=1` 无限重试 → rotating 卡死 → 拨号失败 | `pgrep -f mavo-pcm-bridge` 匹配到执行 shell 自身 | `pgrep -f [m]avo-pcm-bridge.armv7` |
-| 9 | 模块冷复位后所有通话无声 | 重启后 ko 未重载、prepared 缓存骗过检查 | routeAlive 实测 + 全量 bootstrap 自愈 |
-| 10 | pid 文件写不出 → READY 永不通过 | adb shell 内联脚本引号跨层损坏（`case \"$pid` 四重转义） | base64 写文件再 `sh` 执行 |
-| 11 | `hw:0,4 busy errno 16` | 野 mavo 占 VoLTE PCM | stopRemoteRoute 直接 killall，不依赖 pid 文件 |
-| 12 | readLoop 只读一帧就死 | bridge 绑了 AwaitBridge 的 answerCtx（defer cancel 即杀） | bridge 用 session 级 ctx |
-| 13 | 重启 gateway 偶发 panic | Close() 与 URC 竞态：send on closed channel | HandleURC recover 兜底 |
-| 14 | mavo 进程杀不死 | 老进程 D 状态/adb 环境 | killall -9 + 验证循环 |
-| 15 | 短信误发烧话费 | 代码默认 AT+CMGS 真发 | `CELLBRIDGE_SMS_DRY_RUN` 默认 true（CMGW） |
-| 16 | 短号短信 PDU 卡 `>` 提示符 | 输入提示符被 tty 抢占 | ≤6 位短号走 AT+CMGF=1 文本模式 |
-| 17 | SDP c= 写公网 IP → RTP 发去公网回不来 | YakPhone SDP 使用家宽出口地址 | RTP 目的=INVITE 源 IP+SDP 端口 |
-| 18 | 振铃中 180 后无 200 | 多轮叠加：路由回收时机/pid 转义/killall 残留/routePrepared 短路 | 前述 7/9/10 组合修复 |
-| 19 | 上行断续或积压 | RTP 突发、声卡饥饿，或 bridge 与 ALSA 两个定时器重复写静音 | bridge 单独按 20ms 写入；ALSA prime 首次 WritePCM 后退出；上层缓冲最多 6 帧，丢弃过期帧并记录队列统计 |
-| 20 | 对方听到手机语音延迟 1–3 秒 | 原 8192 样本播放环约 1 秒、默认满环启动，上层还可积压 1 秒 | 改为 `--buffer-size=640 --period-size=160`，aplay 增加 `--start-delay=40000`；QNAP 合成 PCM 验证通过，用户确认真实通话延迟明显改善，详见部署文档 |
-| 21 | **重启后通话/短信全失效**（fnOS 等带系统 adb 的系统） | fnOS 开机自启系统 adb daemon（tcp:5037），**adb 的 USB transport 发现是单监听者**——系统 daemon 抢占后，gateway 自己的 adb 永远枚举不到模块（表现为拨号冻结、probe 报 "no ready ADB device"） | gateway 每个 adb 调用前自动 `pkill` 系统 adb daemon + 自建私网 daemon（`-L tcp:localhost:5038`）。**普通 Linux（Debian/群晖等）无系统 adb daemon，不会遇到此问题，修复对它们是无感兜底** |
-| 22 | 同 21 伴随：冷启动 probe 被 8s 超时掐断 → voice 降级 control-only | USB 重枚举 + adb server 冷启动超过 8 秒 | probe 超时升 30s；transportID 重试 8×750ms |
-
----
-
-## 14. 安全与话费保护
-
-- **默认 dry-run**：不开 `CELLBRIDGE_SMS_DRY_RUN=false` 就永远只存不发，杜绝误发短信扣费。
-- **token/密码**：仓库示例一律 `[REDACTED]`；`push_token`、SIP 密码、device token 由用户自填，不入库不入仓库。
-- **避免一刀切**：SIP 注册仍允许任意已配置账号；API 需 bearer token（设备配对生成）。
-- 日志 `redact_logs: true` 打开，敏感字段自动打码。
-
----
-
-## 15. 开源信息与法律
-
-- **仅开源可复刻部分**：gateway 源码、infra 示例配置、tools 自测脚本、本文档。
-- **不随仓库分发**：QDC507 模块侧运行时（qdc507_aprv3.ko / qdc507_voice.ko / mavo-pcm-bridge / alsaucm）——这些是模块厂商闭源二进制，用户需自行获得（参考 DJOneHub 项目与模块附带的固件材料）。
-- 参考项目：https://github.com/ZenGeekLabs/DJOneHub（DJI 一代 4G 模块 macOS 管理工具，USB 通道/eSIM 实现可参照）；https://github.com/AmorXxx/iPhone_air_esim_tutorial（EC20 系 UAC+asterisk-chan-quectel 短信/语音桥接思路）。
-- License：见仓库 LICENSE（建议 MIT for 源码；文档 CC-BY-4.0）。
+自动化测试使用模拟的模块、AT 和 UDP，不会拨打电话，也不会发送短信。
+
+## 限制
+
+- 只支持 QDC507；一张 SIM，同一时间只能有一通电话。
+- 已在 QNAP 上实测通过：前台注册、呼入和呼出双向通话、响铃时取消、锁屏推送接听、短信接收、容器重启恢复。
+- 尚未验收：QNAP 上的短信真实发送、超过 60 秒的长通话、连续多通重拨、USB 热插拔、
+  模块或 NAS 重启后的自动恢复、多日 Token 轮换。
+- 上游的串口传输和 arm64 平台在本项目改动后没有做过真机回归测试。
+- 语音为 PCMU/8000，没有启用 TLS/SRTP，传输加密依赖 Tailscale。
+- 锁屏来电依赖 YakPhone Pro。Linphone 等其他 SIP 客户端可以在前台通话，但没有推送。
+- 模块语音运行时下载自 [mavo](https://github.com/moluncn/mavo)，能否获取取决于该仓库。
+
+## 贡献
+
+欢迎提交问题报告、测试用例、文档修正和补丁。
+
+1. Fork 本仓库并创建分支。
+2. 为改动的行为补充或更新测试。
+3. 运行[开发](#开发)中的测试。
+4. 按 [Conventional Commits](https://www.conventionalcommits.org/) 撰写提交信息，然后发起 Pull Request。
+
+报告通话问题时请附上网关日志、NAS 型号与系统版本。
+**请先删除手机号、短信正文、SIP 密码和 Tailscale 地址。**
+
+## 许可证
+
+基于 MIT 许可证发布，详见 [LICENSE](LICENSE)。
+模块侧语音运行时不在本许可证范围内。
+
+## 致谢
+
+感谢以下项目和作者：
+
+- [CellBridge](https://github.com/mccding/CellBridge)：本项目的上游，提供了
+  QDC507 + NAS + YakPhone 的整体架构、网关代码和完整复刻教程。没有它就没有 CBD。
+- [dontmove-kit](https://github.com/SheldonJoO/dontmove-kit)：SIP 呼叫处理、事件分发、CLCC 来电判定、
+  USB AT 接口选择和短信状态持久化改编自该项目（MIT）。
+- [mavo](https://github.com/moluncn/mavo)：提供模块侧语音运行时。
+- [DJOneHub](https://github.com/ZenGeekLabs/DJOneHub)、[dji-voice-go](https://github.com/iniwex5/dji-voice-go)、
+  [iPhone_air_esim_tutorial](https://github.com/AmorXxx/iPhone_air_esim_tutorial)：
+  模块 USB 通道、ADB 解锁和 UAC 语音桥接方面的参考。
+- [pion](https://github.com/pion)、[gorilla/websocket](https://github.com/gorilla/websocket)、
+  [modernc.org/sqlite](https://gitlab.com/cznic/sqlite)、[google/uuid](https://github.com/google/uuid)、
+  [zeroconf](https://github.com/grandcat/zeroconf)、[yaml.v3](https://github.com/go-yaml/yaml)、
+  [PyUSB](https://github.com/pyusb/pyusb)、[libusb](https://libusb.info/)：网关依赖的开源库。
+- [Tailscale](https://tailscale.com/) 和 [YakPhone](https://apps.apple.com/cn/app/yak-ai-sip-%E7%94%B5%E8%AF%9D/id6763033863)：组网与手机客户端。
+- README 结构参考 [Best-README-Template](https://github.com/othneildrew/Best-README-Template)。
+
+[go-shield]: https://img.shields.io/badge/Go-1.25-00ADD8?style=for-the-badge&logo=go&logoColor=white
+[go-url]: https://go.dev/
+[docker-shield]: https://img.shields.io/badge/Docker-Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white
+[docker-url]: infra/docker/docker-compose.qnap.yml
+[license-shield]: https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge
+[license-url]: LICENSE
